@@ -24,15 +24,15 @@ PrimeVul   ───┘   (join on        (test window drawn     (6 items per   
 
 **Pipeline ordering is load-bearing.** The bank is generated _after_ the test window is drawn and _before_ any per-seed partition. That ordering is what makes the generated artifacts — distill-self rationales, distill-external traces, DPO negatives — cacheable static files reusable across every seed and every matrix, which the compute budget depends on. An earlier draft generated the bank from "training and dev facts," which are per-seed quantities; that would have forced regeneration of ~20,000 items three times over and made the cached-file claim false. It also ran the signal audit and rationale generation _before_ the bank existed, which is simply unrunnable. Corrected below.
 
-**Fact table.** One row per CVE, carrying description, CWE, sibling CWEs, CVSS v3.x base vector, vulnerable function, patched function, patch line set, publication date. Rows missing any field are dropped.
+**Fact table.** One row per CVE, keyed on CVE ID, carrying description, CWE, sibling CWEs, CVSS v3.x base vector, vulnerable function, patched function, patch line set, publication date. Rows missing any field are dropped; an empty sibling list is a value, not a missing field. Functions come from PrimeVul v0.1's paired files. Where a CVE has several vulnerable functions, one is kept: the function named in the NVD description, else a fixed hash choice. Pins and outcomes are in `docs/decisions/step1_decision_record.md`.
 
-The patch line set is derived by diffing the vulnerable function against its patched counterpart. Whitespace and formatting are normalised before diffing so reindentation doesn't inflate the target. Insertions are attributed to the line preceding the insertion point, uniformly. Rows where the patch touches more than 20% of the function are dropped — a rewrite is not a localisation item.
+The patch line set is derived by diffing the vulnerable function against its patched counterpart. Lines are compared on a normalised key (whitespace removed, comments masked), so reindentation and comment edits don't inflate the target. Blank and comment-only lines take no part in the diff, and the stored function keeps its original text. Insertions are attributed to the preceding code line, uniformly. Rows where the patch touches more than 20% of the function's code lines are dropped — a rewrite is not a localisation item. So are rows that insert more than 20% of that count, since insertion attribution would otherwise hide a rewrite behind one gold line.
 
-**Function length cap.** Functions longer than 1,024 tokens under the backbone's tokenizer are dropped at the fact-table stage, before any split is drawn. Attention cost is quadratic in sequence length, and a handful of 4,000-token functions would dominate every batch containing them. Applying the cap as a census filter makes it uniform by construction and visible in the filtering table, rather than a training-time truncation applied inconsistently across arms. Report N dropped.
+**Function length cap.** Functions longer than 10,000 tokens under the backbone's tokenizer (the longer of the vulnerable and patched versions) are dropped at the fact-table stage, before any split is drawn. Applying the cap as a census filter makes it uniform by construction and visible in the filtering table, rather than a training-time truncation applied inconsistently across arms. Report N dropped. The cap was raised from 1,024 because 1,024 would have left 1,327 CVEs, below the reduce-scope line. The cost is that long functions (median ~800 tokens, p95 ~5,200) dominate the batches they land in, since attention cost is quadratic in sequence length. Length bucketing and the compute estimates below must account for that.
 
-Line numbering presented to the model must match the numbering of the normalised diff, 1-indexed. Verify on a sample of 50 items before generating the bank; a silent off-by-N invalidates the entire column. The prompt states the convention explicitly, so numbering is a property of the task rather than something the model must infer.
+Line numbering presented to the model must match the numbering of the stored function, 1-indexed. It is also the diff's numbering, because normalisation maps lines one-to-one. Verify on a sample of 50 items before generating the bank; a silent off-by-N invalidates the entire column. The prompt states the convention explicitly, so numbering is a property of the task rather than something the model must infer.
 
-**Filtering census.** Report N surviving each stage before any split is drawn: after the NVD join, after field completeness, after CWE placeholder removal, after CVSS v3.x pinning, after the 20% patch rule, after the length cap. Split percentages assume roughly 2500–4000 surviving CVEs; below 2500 apply the split fallback, and below roughly 1500 reduce scope (fewer arms or fewer types) rather than shaving splits further.
+**Filtering census.** Report N surviving each stage before any split is drawn: after pair integrity, after the NVD join, after field completeness, after CWE resolution, after CVSS v3.x pinning, after the empty-patch rule, after the 20% patch rule, after the insertion guard, after the length cap, after the one-function-per-CVE selection. Split percentages assume roughly 2500–4000 surviving CVEs; below 2500 apply the split fallback, and below roughly 1500 reduce scope (fewer arms or fewer types) rather than shaving splits further.
 
 **Census gate on time range.** The CVSS v3.x requirement is not a uniform thinning — it is a cut at the old end of the range. CVSS v3.0 arrived in 2015 and NVD only assigned v3 vectors routinely from late 2015; everything older carries v2 and nothing else, so a large share of PrimeVul's BigVul-derived CVEs are dropped. That matters because the whole design rests on a chronological split producing a genuine distribution shift between train and test. Over a compressed window, train and test resemble each other, the M1→M2 gap shrinks, and the minimum detectable effect comes back large.
 
@@ -70,7 +70,7 @@ Six workloads in this experiment generate text, and generation — not backpropa
 
 Generation has two phases. **Prefill** reads the prompt, processing all tokens in parallel — fast per token, and a shape GPUs handle well. **Decode** writes the answer one token at a time, each token requiring the full model weights to be re-read from memory; on an A40 that is bounded by ~696 GB/s of memory bandwidth, not by arithmetic.
 
-This experiment's workload is prefill-heavy and decode-light: prompts are long (a whole C function, up to 1,024 tokens) and answers are tiny (`LINES: 12, 13, 17` is about 15 tokens). That is the shape where naive generation wastes the most, and where vLLM's three mechanisms pay off hardest.
+This experiment's workload is prefill-heavy and decode-light: prompts are long (a whole C function, median ~800 tokens and up to 10,000) and answers are tiny (`LINES: 12, 13, 17` is about 15 tokens). That is the shape where naive generation wastes the most, and where vLLM's three mechanisms pay off hardest.
 
 |Mechanism|What it fixes|
 |---|---|
@@ -78,7 +78,7 @@ This experiment's workload is prefill-heavy and decode-light: prompts are long (
 |**PagedAttention**|KV cache allocated per token actually generated, in small pages — no padding across mixed-length functions, no memory reserved for `max_new_tokens` that is never used|
 |**Continuous batching**|A finished sequence frees its slot immediately; no waiting for the slowest member of a batch|
 
-For a 1,024-token function generating 8 rollouts of ~15 tokens, prefix sharing alone removes roughly 87% of total token work. It is a genuine reduction in computation, not better scheduling.
+For an 800-token function (roughly the fact-table median) generating 8 rollouts of ~15 tokens, prefix sharing alone removes roughly 86% of total token work, and more for longer functions. It is a genuine reduction in computation, not better scheduling.
 
 ### Pinned engine configuration
 
@@ -149,7 +149,7 @@ Every item below is a knob that can move a score by several points after results
 |Relation of prediction to gold|Score|
 |---|---|
 |Exact match|1.0|
-|Sibling or child, 1 hop|0.5|
+|Child (1 hop), or sibling (2 ChildOf edges via a shared parent)|0.5|
 |Ancestor, 1 hop|0.25|
 |Any relation, 2 hops|0.25 (0.125 via an ancestor edge)|
 |Otherwise|0|
@@ -176,7 +176,7 @@ The v3.x requirement still truncates the old end of the range, which is what the
 
 **Parity check after the census, before any split:** compare mean per-component agreement of the majority baseline on v3.0 rows against v3.1 rows. Investigate if they differ materially.
 
-Also pinned: diff normalisation; insertion attribution; the 20% patch threshold; the 1,024-token function cap; the line-set matcher; MCQ gold-letter assignment; near-miss construction rules and the external model's identity and version; fixed second-knob values; the vLLM version and both sampling configurations; all answer parsers.
+Also pinned: diff normalisation; insertion attribution; the 20% patch threshold and insertion guard; the 10,000-token function cap; the line-set matcher; MCQ gold-letter assignment; near-miss construction rules and the external model's identity and version; fixed second-knob values; the vLLM version and both sampling configurations; all answer parsers.
 
 ## Splits
 
@@ -663,4 +663,4 @@ The join is sound by construction: PrimeVul was built by matching NVD descriptio
 
 **Clean evaluation.** Keeping CTI-Bench, CyberMetric and SecBench out of training leaves them available as independent external checks.
 
-Two caveats to verify before committing: PrimeVul excludes multi-function vulnerabilities and anything absent from NVD, which biases the sample; and models perform poorly on it — StarCoder2 drops from 68 F1 on BigVul to 3 on PrimeVul, largely because of the paired metric. The signal audit is the check, and it decides whether the find-the-error column can rank anything for any arm before training compute is spent. Line localisation partly hedges: same code, continuous scoring, so partial overlap still separates arms where a binary label gives everyone zero.
+Two caveats to verify before committing: PrimeVul excludes anything absent from NVD, which biases the sample. It does contain multi-function vulnerabilities (446 CVEs in v0.1's paired files have more than one pair), and the fact table keeps one function per CVE; and models perform poorly on it — StarCoder2 drops from 68 F1 on BigVul to 3 on PrimeVul, largely because of the paired metric. The signal audit is the check, and it decides whether the find-the-error column can rank anything for any arm before training compute is spent. Line localisation partly hedges: same code, continuous scoring, so partial overlap still separates arms where a binary label gives everyone zero.

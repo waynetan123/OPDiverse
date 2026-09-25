@@ -1,1 +1,11 @@
 *.venv
+__pycache__/
+.pytest_cache/
+
+# Large step-1 downloads and cache (sha256s recorded in data/combined_dataset/manifest.json)
+data/
+
+# Large step-1 outputs (sha256s recorded in the manifest)
+data/combined_dataset/facts.jsonl
+data/combined_dataset/candidates.jsonl
+data/combined_dataset/drops.jsonl

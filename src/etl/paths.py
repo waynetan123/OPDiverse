@@ -93,5 +93,38 @@ class Paths:
     def baselines_json(self) -> Path:
         return self.out / "baselines.json"
 
+    # Step 3: contamination probe
+    @property
+    def probe(self) -> Path:
+        return self.data / "probe"
+
+    @property
+    def probe_requests(self) -> Path:
+        return self.probe / "requests.jsonl"
+
+    @property
+    def probe_generations(self) -> Path:
+        return self.probe / "generations.jsonl"
+
+    @property
+    def probe_run_meta(self) -> Path:
+        return self.probe / "run_meta.json"
+
+    @property
+    def probe_scores(self) -> Path:
+        return self.probe / "scores.jsonl"
+
+    @property
+    def probe_recalled(self) -> Path:
+        return self.probe / "recalled.jsonl"
+
+    @property
+    def probe_report_json(self) -> Path:
+        return self.probe / "report.json"
+
+    @property
+    def probe_report_md(self) -> Path:
+        return self.probe / "report.md"
+
 
 DEFAULT = Paths(ROOT / "data")

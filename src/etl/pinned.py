@@ -70,6 +70,57 @@ DIRECTION_AWARE_CREDIT = {
     "far": Fraction(0),
 }
 
+# ---------------------------------------------------------------------------
+# Evaluation decoding (step 3; the plan's uniform evaluation settings)
+# ---------------------------------------------------------------------------
+
+EVAL_MAX_TOKENS = 512
+# Greedy. Qwen's generation_config.json defaults to temperature 0.7 / top-p 0.8 / top-k 20 /
+# repetition penalty 1.05, and vLLM applies it unless told not to; every field is set explicitly.
+EVAL_SAMPLING = {
+    "n": 1,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "repetition_penalty": 1.0,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "max_tokens": EVAL_MAX_TOKENS,
+    "seed": 0,
+}
+EVAL_DTYPE = "bfloat16"
+# Qwen's generation_config lists both as EOS; with that config ignored, the runner stops on both explicitly.
+EVAL_STOP_TOKENS = ("<|im_end|>", "<|endoftext|>")
+EVAL_MAX_MODEL_LEN = 1024  # probe prompts are ~80 tokens; raise for bank evaluation (functions up to 10,000 tokens)
+# The Qwen2.5 chat template inserts this when no system message is given.
+QWEN_SYSTEM_PROMPT = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+# Filled in from run_meta.json after the first vLLM run; every later evaluation must match it.
+VLLM_VERSION: str | None = None
+
+# ---------------------------------------------------------------------------
+# Contamination probe (step 3)
+# ---------------------------------------------------------------------------
+
+PROBE_SAMPLE_SIZE = 300
+PROBE_SALT = "contamination-probe"
+PROBE_PROMPTS = {
+    "cwe": (
+        "Which CWE (Common Weakness Enumeration) weakness does {cve_id} correspond to? "
+        "Reply with a single CWE ID in the form CWE-<number> and nothing else. "
+        "If you are not sure, give your best guess."
+    ),
+    "cvss": (
+        "What is the CVSS v3.1 base vector of {cve_id}? "
+        "Reply with the vector only, in the form AV:_/AC:_/PR:_/UI:_/S:_/C:_/I:_/A:_, and nothing else. "
+        "If you are not sure, give your best guess."
+    ),
+}
+PROBE_MATERIAL = Fraction(1, 20)   # recall margin >= 5 points (with p < alpha) -> sensitivity run
+PROBE_LARGE = Fraction(3, 20)      # recall margin >= 15 points -> reconsider backbone / extend forward
+PROBE_ALPHA = 0.05
+PROBE_PERMUTATIONS = 10_000
+PROBE_BOOTSTRAP = 2_000
+PROBE_SEED = 0
+
 # Deprecated CWE-1000 weaknesses -> replacement, read from each entry's Description in the
 # 4.20 XML. A replacement is recorded only where MITRE names exactly one successor; None
 # means the row is dropped. Keys must cover every deprecated weakness in the release.

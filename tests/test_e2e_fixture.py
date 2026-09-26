@@ -234,3 +234,57 @@ def test_rerun_is_byte_identical_across_hash_seeds(built, tmp_path):
                        env={**os.environ, "PYTHONPATH": str(ROOT / "src"), "PYTHONHASHSEED": seed})
         digests.append([hashlib.sha256(p.read_bytes()).hexdigest() for p in names])
     assert digests[0] == digests[1]
+
+
+# --- Step 2 ------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def windowed(built):
+    data, tok, args = built
+    assert build.main(["test-window", *args]) == 0
+    return data, tok, args
+
+
+def test_test_window(windowed):
+    data, _, _ = windowed
+    out = Paths(data)
+    split_rows = build.read_jsonl(out.split)
+    assert [(r["cve_id"], r["pool"], r["moved"]) for r in split_rows] == [
+        ("CVE-2016-0001", "nontest", False), ("CVE-2017-0002", "nontest", False), ("CVE-2021-0010", "test", False)]
+    tw = json.loads(out.test_window_json.read_text())
+    assert (tw["k"], tw["boundary_day"], tw["final"]) == (1, "2021-12-01", {"test": 1, "nontest": 2})
+    assert tw["facts_sha256"] == hashlib.sha256(out.facts.read_bytes()).hexdigest()
+    base = json.loads(out.baselines_json.read_text())
+    h = base["exact_id_hierarchy"]
+    assert h["symmetric_top"][0]["cwe"] == "CWE-125" and h["symmetric_top"][0]["mean_exact"] == "5/8"
+    assert h["decision"] == pinned.EXACT_ID_SCHEDULE == "direction_aware"
+    assert out.test_window_md.read_text().startswith("# Step 2: frozen test window")
+    assert "split" in json.loads(out.manifest.read_text())["outputs"]
+
+
+def test_test_window_rerun_is_identical(windowed):
+    data, _, args = windowed
+    out = Paths(data)
+    before = [p.read_bytes() for p in (out.split, out.test_window_json, out.baselines_json)]
+    assert build.main(["test-window", *args]) == 0
+    assert [p.read_bytes() for p in (out.split, out.test_window_json, out.baselines_json)] == before
+
+
+def test_test_window_is_frozen(windowed, tmp_path):
+    import shutil
+
+    data, tok, _ = windowed
+    changed_facts = tmp_path / "facts_changed"
+    shutil.copytree(data, changed_facts, symlinks=True)
+    facts = Paths(changed_facts).facts
+    facts.write_text("".join(facts.read_text().splitlines(keepends=True)[:-1]))
+    with pytest.raises(SystemExit, match="facts.jsonl changed"):
+        build.main(["test-window", "--data-dir", str(changed_facts), "--tokenizer", str(tok), "--unpinned-tokenizer"])
+
+    changed_split = tmp_path / "split_changed"
+    shutil.copytree(data, changed_split, symlinks=True)
+    s = Paths(changed_split).split
+    s.write_text(s.read_text().replace('"pool": "test"', '"pool": "nontest"'))
+    with pytest.raises(SystemExit, match="redrawn window differs"):
+        build.main(["test-window", "--data-dir", str(changed_split), "--tokenizer", str(tok), "--unpinned-tokenizer"])

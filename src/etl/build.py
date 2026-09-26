@@ -1,4 +1,4 @@
-"""Step 1: build the fact table.
+"""Steps 1-2: build the fact table, then draw the frozen test window.
 
     PYTHONPATH=src python -m etl.build extract-nvd    # yearly NVD feeds -> data/cache/nvd_subset.jsonl.gz
     PYTHONPATH=src python -m etl.build build          # -> facts / candidates / drops / census.json
@@ -6,6 +6,9 @@
     PYTHONPATH=src python -m etl.build verify-sheet   # -> verification/line_sheet.{md,csv}
     PYTHONPATH=src python -m etl.build check          # invariants over facts.jsonl
     PYTHONPATH=src python -m etl.build all            # build, report, verify-sheet, check
+    PYTHONPATH=src python -m etl.build test-window    # step 2 -> split.jsonl, test_window.{json,md}, baselines.json
+
+`test-window` is not part of `all`: the window is drawn once and then frozen.
 """
 
 from __future__ import annotations
@@ -16,9 +19,9 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from . import census, nvd, parity, pinned, verify_sheet
+from . import census, nvd, parity, pinned, split, verify_sheet
 from .cwe_graph import CweGraph, load_cwe_graph
-from .manifest import write_manifest
+from .manifest import file_sha256, write_manifest
 from .paths import DEFAULT, ROOT, Paths
 from .primevul import INTEGRITY_REASONS, load_pairs
 from .tokens import TokenCounter, pinned_counter
@@ -41,11 +44,13 @@ PAIR_STAGES = (  # (stage, reason)
 )
 
 
+def jsonl_bytes(rows: list[dict]) -> bytes:
+    return "".join(json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n" for row in rows).encode("utf-8")
+
+
 def write_jsonl(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        for row in rows:
-            f.write(json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n")
+    path.write_bytes(jsonl_bytes(rows))
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -364,7 +369,10 @@ def manifest(paths: Paths, tokenizer_path: Path) -> None:
     inputs["cwe_xml"] = paths.cwe_xml
     inputs["tokenizer_json"] = tokenizer_path
     inputs["nvd_subset"] = paths.nvd_subset
-    outputs = {name: getattr(paths, name) for name in ("facts", "candidates", "drops", "census_json", "census_md", "parity_json")}
+    outputs = {name: getattr(paths, name) for name in (
+        "facts", "candidates", "drops", "census_json", "census_md", "parity_json",
+        "split", "test_window_json", "test_window_md", "baselines_json",
+    )}
     for f in sorted(paths.verification.glob("*")) if paths.verification.exists() else []:
         outputs[f"verification/{f.name}"] = f
     feeds = json.loads(paths.nvd_feeds_info.read_text(encoding="utf-8")) if paths.nvd_feeds_info.exists() else None
@@ -372,6 +380,39 @@ def manifest(paths: Paths, tokenizer_path: Path) -> None:
         "nvd_feeds": feeds,
         "tokenizer": {"repo": pinned.TOKENIZER_REPO, "revision": pinned.TOKENIZER_REVISION},
     })
+
+
+def test_window(paths: Paths) -> tuple[dict, dict]:
+    """Step 2. Deterministic in facts.jsonl; refuses to change an already-drawn window."""
+    facts = read_jsonl(paths.facts)
+    facts_sha = file_sha256(paths.facts)
+    if paths.test_window_json.exists():
+        drawn_from = json.loads(paths.test_window_json.read_text(encoding="utf-8"))["facts_sha256"]
+        if drawn_from != facts_sha:
+            raise SystemExit(f"facts.jsonl changed since the test window was drawn (from {drawn_from[:12]}…, now "
+                             f"{facts_sha[:12]}…). The window is frozen: restore the facts, or delete the step-2 files "
+                             "deliberately and record why.")
+    tw = split.draw_test_window(facts)
+    assignments = tw.pop("assignments")
+    new_split = jsonl_bytes(assignments)
+    if paths.split.exists() and paths.split.read_bytes() != new_split:
+        raise SystemExit("split.jsonl exists and the redrawn window differs. The window is frozen: "
+                         "delete the step-2 files deliberately and record why before redrawing.")
+    pool_of = {a["cve_id"]: a["pool"] for a in assignments}
+    graph = load_cwe_graph(paths.cwe_xml)
+    base = split.baselines([r for r in facts if pool_of[r["cve_id"]] == "nontest"], graph)
+    decision = base["exact_id_hierarchy"]["decision"]
+    if decision != pinned.EXACT_ID_SCHEDULE:
+        raise SystemExit(f"the constant-answer baseline selects the {decision} schedule but pinned.EXACT_ID_SCHEDULE "
+                         f"is {pinned.EXACT_ID_SCHEDULE!r}; the computed number decides, so update the pin and the record")
+    tw = {"facts_sha256": facts_sha, "test_fraction": str(pinned.TEST_FRACTION),
+          "near_dup_jaccard": str(pinned.NEAR_DUP_JACCARD), "shingle_n": pinned.SHINGLE_N,
+          "backbone_released": pinned.BACKBONE_RELEASED, **tw, "pools": split.pool_stats(facts, assignments)}
+    paths.split.write_bytes(new_split)
+    write_json(paths.test_window_json, tw)
+    write_json(paths.baselines_json, base)
+    paths.test_window_md.write_text(split.render_markdown(tw, base), encoding="utf-8")
+    return tw, base
 
 
 def check(paths: Paths) -> list[str]:
@@ -417,7 +458,7 @@ def check(paths: Paths) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m etl.build", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=("extract-nvd", "build", "report", "verify-sheet", "check", "all"))
+    ap.add_argument("command", choices=("extract-nvd", "build", "report", "verify-sheet", "check", "all", "test-window"))
     ap.add_argument("--data-dir", type=Path, default=DEFAULT.data)
     ap.add_argument("--tokenizer", type=Path, help="override tokenizer.json (tests)")
     ap.add_argument("--unpinned-tokenizer", action="store_true", help="skip the tokenizer sha256 check (tests)")
@@ -432,6 +473,14 @@ def main(argv: list[str] | None = None) -> int:
         info = extract_nvd(paths)
         print(f"NVD: {info['found']:,} of {info['needed']:,} CVEs found in {len(info['feeds'])} feeds "
               f"({len(info['missing'])} missing, {info['cross_feed_duplicates']} cross-feed duplicates)")
+        return 0
+    if args.command == "test-window":
+        tw, base = test_window(paths)
+        manifest(paths, tokenizer_path)
+        h = base["exact_id_hierarchy"]
+        print(f"test window: {tw['final']['test']:,} of {tw['n']:,} CVEs from {tw['boundary_day']} "
+              f"({len(tw['moved'])} moved to non-test); exact-ID schedule: {h['decision']} "
+              f"(symmetric best {h['symmetric_top'][0]['cwe']} {h['symmetric_top'][0]['mean']:.4f})")
         return 0
     if args.command in ("build", "all"):
         doc = build(paths, counter())

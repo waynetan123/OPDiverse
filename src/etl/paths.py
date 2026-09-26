@@ -76,5 +76,22 @@ class Paths:
     def manifest(self) -> Path:
         return self.out / "manifest.json"
 
+    # Step 2
+    @property
+    def split(self) -> Path:
+        return self.out / "split.jsonl"
+
+    @property
+    def test_window_json(self) -> Path:
+        return self.out / "test_window.json"
+
+    @property
+    def test_window_md(self) -> Path:
+        return self.out / "test_window.md"
+
+    @property
+    def baselines_json(self) -> Path:
+        return self.out / "baselines.json"
+
 
 DEFAULT = Paths(ROOT / "data")

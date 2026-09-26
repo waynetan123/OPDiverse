@@ -1,8 +1,8 @@
-"""Pinned definitions for the OPDiverse fact table.
+"""Pinned definitions for the OPDiverse fact table, test window and hierarchy scoring.
 
-Everything here can move a census count or a score. It is frozen before step 0: any change
-needs a matching entry in docs/decisions/step1_decision_record.md. Pure functions, stdlib
-only, no I/O.
+Everything here can move a census count, a split or a score. It is frozen before step 0: any
+change needs a matching entry in docs/decisions/step{1,2}_decision_record.md. Pure functions,
+stdlib only, no I/O.
 """
 
 from __future__ import annotations
@@ -27,6 +27,8 @@ TOKENIZER_REPO = "Qwen/Qwen2.5-7B-Instruct"
 # HF commit of Qwen/Qwen2.5-7B-Instruct (lastModified 2025-01-12) and the sha256 of its tokenizer.json.
 TOKENIZER_REVISION: str | None = "a09a35458c702b33eeacc393d103063234e8bc28"
 TOKENIZER_SHA256: str | None = "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539"
+# Public release date of Qwen2.5. Its pretraining cutoff is not published; reported beside the split boundary.
+BACKBONE_RELEASED = "2024-09-19"
 
 # ---------------------------------------------------------------------------
 # Filters
@@ -35,6 +37,38 @@ TOKENIZER_SHA256: str | None = "c0382117ea329cdf097041132f6d735924b697924d6f6fc3
 TOKEN_CAP = 10_000
 TOKEN_CAP_REPORT = (1_024, 2_048, 4_096)
 PATCH_FRACTION = Fraction(1, 5)
+
+# ---------------------------------------------------------------------------
+# Test window (step 2)
+# ---------------------------------------------------------------------------
+
+TEST_FRACTION = Fraction(3, 20)
+NEAR_DUP_JACCARD = Fraction(4, 5)
+SHINGLE_N = 3
+
+# ---------------------------------------------------------------------------
+# Exact-ID hierarchy credit (step 2)
+# ---------------------------------------------------------------------------
+
+# If the best constant answer's mean symmetric score over non-test facts exceeds this, the
+# direction-aware schedule is adopted. The computed number decides; see baselines.json.
+EXACT_ID_THRESHOLD = Fraction(1, 5)
+SCHEDULES = ("symmetric", "direction_aware")
+# Decided at step 2: best constant CWE-119 scores 0.262 under the symmetric schedule (> 0.2).
+EXACT_ID_SCHEDULE = "direction_aware"
+SYMMETRIC_CREDIT = {0: Fraction(1), 1: Fraction(1, 2), 2: Fraction(1, 4)}
+# Relation of prediction to gold -> credit. At distance 2, a prediction that is an ancestor of
+# gold (by any path) takes the ancestor discount; every other 2-hop relation scores 1/4.
+DIRECTION_AWARE_CREDIT = {
+    "exact": Fraction(1),
+    "child": Fraction(1, 2),
+    "parent": Fraction(1, 4),
+    "descendant_2": Fraction(1, 4),   # grandchild
+    "sibling": Fraction(1, 4),        # shares a parent
+    "coparent": Fraction(1, 4),       # shares a child
+    "ancestor_2": Fraction(1, 8),     # grandparent, or an ancestor also reachable in 2 hops
+    "far": Fraction(0),
+}
 
 # Deprecated CWE-1000 weaknesses -> replacement, read from each entry's Description in the
 # 4.20 XML. A replacement is recorded only where MITRE names exactly one successor; None
@@ -205,10 +239,27 @@ def _code_lines(text: str) -> list[tuple[int, str]]:
     return [(i, k) for i, line in enumerate(split_lines(text), 1) if (k := line_key(line))]
 
 
+def _code_keys(text: str) -> list[str]:
+    masked, ok = mask_comments(text)
+    return [k for _, k in _code_lines(masked if ok else text)]
+
+
 def norm_body_hash(text: str) -> str:
     """Whitespace- and comment-insensitive hash of a function, for near-duplicate checks."""
-    masked, ok = mask_comments(text)
-    return sha256_text("\n".join(k for _, k in _code_lines(masked if ok else text)))
+    return sha256_text("\n".join(_code_keys(text)))
+
+
+def code_shingles(text: str) -> frozenset[tuple[str, ...]]:
+    """SHINGLE_N consecutive code-line keys (comment-masked, whitespace removed). A function
+    shorter than SHINGLE_N code lines is one shingle."""
+    keys = _code_keys(text)
+    return frozenset(tuple(keys[i:i + SHINGLE_N]) for i in range(max(1, len(keys) - SHINGLE_N + 1)))
+
+
+def jaccard_at_least(a: frozenset, b: frozenset, threshold: Fraction = NEAR_DUP_JACCARD) -> bool:
+    """|a & b| / |a | b| >= threshold, in exact integer arithmetic."""
+    inter = len(a & b)
+    return inter * threshold.denominator >= (len(a) + len(b) - inter) * threshold.numerator
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +474,57 @@ def resolve_cwe(has_nvd_block: bool, values: list[str], graph: CweLookup) -> tup
     if not graph.in_view(cwe):
         return None, "not_in_view_1000", mapped_from
     return f"CWE-{cwe}", "ok", mapped_from
+
+
+def _neighbours(cwe: str, graph: CweLookup) -> frozenset[str]:
+    return graph.parents(cwe) | graph.children(cwe)
+
+
+def cwe_distance(a: str, b: str, graph: CweLookup) -> int | None:
+    """Shortest undirected ChildOf distance in view 1000 if it is at most 2, else None. Bare IDs."""
+    if a == b:
+        return 0
+    near = _neighbours(a, graph)
+    if b in near:
+        return 1
+    if any(b in _neighbours(n, graph) for n in near):
+        return 2
+    return None
+
+
+def cwe_relation(pred: str, gold: str, graph: CweLookup) -> str:
+    """Key into DIRECTION_AWARE_CREDIT. Bare IDs; gold must be a live view-1000 weakness."""
+    if not graph.in_view(pred):
+        return "far"
+    d = cwe_distance(pred, gold, graph)
+    if d == 0:
+        return "exact"
+    if d == 1:
+        return "child" if pred in graph.children(gold) else "parent"
+    if d == 2:
+        if pred in graph.ancestors(gold):
+            return "ancestor_2"
+        if pred in graph.descendants(gold):
+            return "descendant_2"
+        if any(pred in graph.children(p) for p in graph.parents(gold)):
+            return "sibling"
+        return "coparent"
+    return "far"
+
+
+def hierarchy_score(pred: str, gold: str, graph: CweLookup, schedule: str = EXACT_ID_SCHEDULE) -> Fraction:
+    """Exact-ID hierarchy credit in [0, 1]. 'CWE-n' strings; anything else as pred scores 0."""
+    m, g = _CWE_ID.fullmatch(pred.strip().upper()), _CWE_ID.fullmatch(gold)
+    if g is None or not graph.in_view(g.group(1)):
+        raise ValueError(f"gold {gold!r} is not a live view-{CWE_VIEW} weakness")
+    if m is None or not graph.in_view(m.group(1)):
+        return Fraction(0)
+    p, g = m.group(1), g.group(1)
+    if schedule == "symmetric":
+        return SYMMETRIC_CREDIT.get(cwe_distance(p, g, graph), Fraction(0))
+    if schedule == "direction_aware":
+        return DIRECTION_AWARE_CREDIT[cwe_relation(p, g, graph)]
+    raise ValueError(f"unknown schedule {schedule!r}")
 
 
 def siblings(cwe: str, graph: CweLookup) -> list[str]:

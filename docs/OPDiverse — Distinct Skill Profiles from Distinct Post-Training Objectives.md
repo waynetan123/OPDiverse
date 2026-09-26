@@ -149,10 +149,13 @@ Every item below is a knob that can move a score by several points after results
 |Relation of prediction to gold|Score|
 |---|---|
 |Exact match|1.0|
-|Child (1 hop), or sibling (2 ChildOf edges via a shared parent)|0.5|
+|Child, 1 hop|0.5|
 |Ancestor, 1 hop|0.25|
-|Any relation, 2 hops|0.25 (0.125 via an ancestor edge)|
+|Any other relation, 2 hops (sibling, grandchild, co-parent)|0.25|
+|Ancestor of gold at 2 hops (grandparent, or an ancestor also reachable as a sibling)|0.125|
 |Otherwise|0|
+
+_Outcome (step 2, `docs/decisions/step2_decision_record.md`):_ symmetric baseline CWE-119 = 0.262 > 0.2, so the direction-aware schedule is adopted; re-reported under it, the best constant is CWE-125 = 0.236.
 
 At or below 0.2, the symmetric schedule (1.0 / 0.5 / 0.25 / 0) stands. The computed number decides, not preference, and the decision is recorded before any training run. Re-report the constant-answer baseline under the adopted schedule.
 
@@ -188,7 +191,7 @@ Also pinned: diff normalisation; insertion attribution; the 20% patch threshold 
 
 At 4000 CVEs: 3000 / 400 / 600. At 2500: 1875 / 250 / 375. **Fallback:** below 2500, shift to 70 / 15 / 15. Never shave test.
 
-**Test window is drawn first and once**, immediately after the census — chronologically latest 15%, near-duplicate clusters kept intact. It depends only on publication dates, so it can and must precede bank generation.
+**Test window is drawn first and once**, immediately after the census — chronologically latest 15%, near-duplicate clusters kept intact. It depends only on publication dates, so it can and must precede bank generation. _Drawn at step 2:_ boundary 2021-07-30, 343 test CVEs (15.07%), 1 moved to the earlier side as a near-duplicate (exact normalised hash, or 3-line-shingle Jaccard ≥ 0.8).
 
 **No absolute dev floor.** The earlier 500-CVE minimum counted the wrong unit: each dev CVE contributes **six** question items, so 400 CVEs is 2,400 dev items. Correlation within a CVE puts the effective n below 2,400 but far above 400. The floor was also unsatisfiable — 10% never reaches 500 in the stated census range — so it silently overrode the split it accompanied. Three conditions replace it:
 

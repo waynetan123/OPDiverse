@@ -1,0 +1,3 @@
+# GPU machine only, for `python -m probe.run_vllm` (and later all evaluation).
+# Record the installed version in run_meta.json; it becomes pinned.VLLM_VERSION for every later evaluation.
+vllm

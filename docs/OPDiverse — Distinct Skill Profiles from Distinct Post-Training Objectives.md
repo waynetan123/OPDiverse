@@ -55,10 +55,12 @@ Run after the test window is drawn and before the question bank is generated, on
 
 **Procedure.** Sample 300 CVEs from the drawn test window. Prompt the raw backbone with **the CVE ID alone** — no description, no code, no options — for the CWE, then separately for the CVSS vector. Score with the same verifiers used in the main experiment. Compare against the most-frequent-CWE and majority-component-CVSS baselines computed on training-era facts. With nothing to reason from, any margin above those baselines is recall.
 
-**Decision rule, fixed in advance.**
+**Control.** A training-era constant is not enough on its own: the test window's label mix differs from the training era's (CWE-787 leads in 2021–22), so a model with no CVE-specific memory can beat the constant just by guessing the currently common label. On the pinned 300-CVE sample, always answering CWE-787 scores 0.170 exact against CWE-125's 0.117. Recall is therefore measured as the **margin over a permutation control**: each answer's score against its own CVE's gold, minus its mean score against every other CVE's gold. The constant-baseline comparison is reported alongside.
 
-- **At or near baseline** — record it, state in the write-up that memorisation was probed and not detected, proceed unchanged.
-- **Materially above baseline** — report the margin, and add a pre-registered sensitivity run of the primary test restricted to test CVEs the probe shows are not recalled. If the margin is large, reconsider the backbone or extend the fact table forward via newer NVD entries with fix-commit links, as under the census gate above.
+**Decision rule, fixed in advance.** This applies to either primary measure (CWE exact match; CVSS per-component agreement), with a one-sided permutation p-value (10,000 shuffles, seed 0). Details and pins are in `docs/decisions/step3_decision_record.md`.
+
+- **At or near baseline** (margin < 5 points, or p ≥ 0.05) — record it, state in the write-up that memorisation was probed and not detected, proceed unchanged.
+- **Materially above baseline** (margin ≥ 5 points with p < 0.05) — report the margin, and add a pre-registered sensitivity run of the primary test restricted to test CVEs the probe shows are not recalled. **Large** (margin ≥ 15 points with p < 0.05): reconsider the backbone or extend the fact table forward via newer NVD entries with fix-commit links, as under the census gate above.
 
 Report the result either way.
 

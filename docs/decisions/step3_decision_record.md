@@ -59,12 +59,29 @@ On the pinned sample, the training-era constant CWE-125 scores 0.117 exact, but 
 
 ## Outcome
 
-_Pending the GPU run._
+From `data/probe/report.md` and `report.json`. Generations sha256 `78788b6e…fe430d06`, from requests `a8a4eed3…d946fca`. The pins were committed at `725eeb8` (2026-09-26 22:02 UTC), before the GPU run started (2026-09-29 00:09 UTC).
 
 | | |
 |---|---|
-| Outcome | |
-| CWE exact: observed / control / margin / p | |
-| CVSS: observed / control / margin / p | |
-| Parse rates (lenient / strict) | |
-| vLLM version, GPU | |
+| Outcome | **Not detected.** Memorisation was probed and not detected; proceed unchanged. |
+| CWE exact: observed / control / margin / p | 0.020 / 0.032 / **−1.2 pts** (95% CI −2.6, 0.2) / 0.956 |
+| CVSS: observed / control / margin / p | 0.515 / 0.498 / **+1.7 pts** (95% CI 0.5, 2.9) / 0.005 |
+| CWE hierarchy (secondary): observed / control / margin / p | 0.027 / 0.041 / −1.5 pts (95% CI −2.9, −0.1) / 0.967 |
+| vs the plan's constants | CWE exact −9.7 pts vs CWE-125 (0.117); CVSS −18.3 pts vs the majority vector (0.698); hierarchy −13.8 pts vs CWE-125 (0.165) |
+| Parse rates (lenient / strict) | 1.00 / 1.00 on both questions; the strict margins equal the lenient ones |
+| Recalled CVEs (`recalled.jsonl`) | 6 |
+| vLLM version, GPU | vLLM 0.30.0 (torch 2.13.0+cu130, transformers 5.17.0, CUDA 13.0, Python 3.13.11); 4 × NVIDIA A40 |
+| Run | 600 / 600 finished on a stop token; none hit the 512-token cap. Load 666.5 s, generation 6.4 s |
+| Determinism recheck | 2 of 20 re-generated outputs differed: `CVE-2018-25033:cvss`, `CVE-2020-19860:cwe` |
+
+### Reading
+
+- **CVSS is significant but immaterial.** The +1.7-point margin clears p < 0.05 but not the 5-point bar, so the rule gives "not detected". Most of the 0.515 is the model's habitual vector matching common component values, which the control absorbs.
+- **The CWE answers are a habit, not recall.** Across 300 CVEs the model gives only 5 distinct CWEs: CWE-78 × 185, CWE-787 × 57, CWE-79 × 51, CWE-789 × 5, CWE-665 × 2.
+- **The 6 "recalled" CVEs are chance hits of a habitual answer.** All 6 are CWE-787 answers on CWE-787 gold (CVE-2021-21704, CVE-2021-28021, CVE-2022-27666, CVE-2022-30292, CVE-2022-36041, CVE-2022-37434). The pinned definition excludes only the single most common answer (CWE-78), so CWE-787, the second most common, counts as non-habitual. Answering CWE-787 57 times against 51 CWE-787 golds would hit ≈ 9.7 times by chance, and it hit 6. The file is recorded as specified. It has no use at this outcome, since the sensitivity run applies only to a material result. If the probe is ever re-run, the definition is too loose to identify recall.
+- **The determinism mismatches don't affect the outcome.** Under greedy decoding, the recheck is expected to agree. Two disagreements are consistent with batch-dependent floating-point differences. They cannot move a margin this far from the thresholds. Step 7's engine-agreement check should expect this level of run-to-run variation.
+
+## Open for later steps
+
+- **`watermarking=True` in the recorded `SamplingParams`.** The runner doesn't set it, and it isn't pinned. Before `pinned.VLLM_VERSION = "0.30.0"` is fixed for every later evaluation, confirm what this does in vLLM 0.30.0 and whether it alters greedy token choice. If it does, disable it explicitly in `EVAL_SAMPLING` and record the change here. It may also be behind the determinism mismatches.
+- **`pinned.VLLM_VERSION`** is still `None`. Set it once the watermarking question is settled.

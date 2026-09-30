@@ -108,4 +108,187 @@ def test_scores_in_unit_interval(graph):
 
 
 def test_registry():
-    assert set(verifiers.VERIFIERS) == {"exact_id", "cvss"}
+    assert set(verifiers.VERIFIERS) == {"mcq", "exact_id", "cvss", "find_error", "line_loc"}
+
+
+# --- MCQ ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("reply, parsed, strict", [
+    ("ANSWER: B", "B", True),
+    ("  ANSWER: B\n", "B", True),
+    ("answer: (C)", "C", False),
+    ("**Answer:** D", "D", False),
+    ("The flaw is a read, so ANSWER: A ... wait, ANSWER: C", "C", False),  # the last ANSWER: wins
+    ("B", "B", False),
+    ("(B).", "B", False),
+    ("I think option D fits best.", "D", False),
+    ("The answer is B because the read is out of bounds.", "B", False),
+    ("Between (A) and (C), I pick (C).", "C", False),
+])
+def test_parse_mcq(reply, parsed, strict):
+    assert verifiers.parse_mcq(reply) == parsed
+    assert verifiers.strict_mcq(reply) is strict
+
+
+@pytest.mark.parametrize("reply", [
+    "answer: a buffer overflow",   # lower-case 'a' is an article, not an option
+    "It is CWE-787.",
+    "ANSWER: E",
+    "",
+])
+def test_parse_mcq_failures(reply):
+    assert verifiers.parse_mcq(reply) is None
+
+
+def test_verify_mcq():
+    assert verifiers.verify_mcq("ANSWER: B", "B") == verifiers.Verdict("B", True, True, Fraction(1), Fraction(1))
+    assert verifiers.verify_mcq("ANSWER: A", "B").metric == 0
+    assert verifiers.verify_mcq("no idea", "B") == verifiers.Verdict(None, False, False, Fraction(0), Fraction(0))
+
+
+# --- Find-the-error ------------------------------------------------------------
+
+
+@pytest.mark.parametrize("reply, label, cwe, strict", [
+    ("VULNERABLE: yes, CWE-787", True, "CWE-787", True),
+    ("VULNERABLE: no", False, None, True),
+    ("vulnerable: YES (CWE-125)", True, "CWE-125", False),
+    ("It copies without a bound. VULNERABLE: yes", True, None, False),
+    ("VULNERABLE: yes, CWE-787 ... on reflection VULNERABLE: no", False, None, False),
+    ("This function is not vulnerable.", False, None, False),
+    ("There is no vulnerability here.", False, None, False),
+    ("The function is vulnerable to an out-of-bounds read (CWE-125).", True, "CWE-125", False),
+    ("It looked vulnerable at first, but it is not vulnerable.", False, None, False),
+    ("VULNERABLE: no, CWE-787", False, None, False),
+])
+def test_parse_find_error(reply, label, cwe, strict):
+    assert verifiers.parse_find_error(reply) == (label, cwe)
+    assert verifiers.strict_find_error(reply) is strict
+
+
+def test_parse_find_error_failure():
+    assert verifiers.parse_find_error("The loop runs to len.") == (None, None)
+
+
+def test_verify_find_error(graph):
+    v = verifiers.verify_find_error("VULNERABLE: yes, CWE-787", True, "CWE-787", graph)
+    assert (v.parsed, v.strict_ok, v.metric, v.dense) == ("VULNERABLE: yes, CWE-787", True, 1, 1)
+    v = verifiers.verify_find_error("VULNERABLE: yes, CWE-119", True, "CWE-787", graph)
+    assert (v.metric, v.dense) == (1, Fraction(1, 2) + Fraction(1, 8))  # label 1/2 + half of the 1/4 parent credit
+    v = verifiers.verify_find_error("VULNERABLE: yes", True, "CWE-787", graph)
+    assert (v.metric, v.dense) == (1, Fraction(1, 2))
+    v = verifiers.verify_find_error("VULNERABLE: no", True, "CWE-787", graph)
+    assert (v.metric, v.dense) == (0, 0)
+    v = verifiers.verify_find_error("VULNERABLE: no", False, "CWE-787", graph)
+    assert (v.metric, v.dense) == (1, 1)
+    v = verifiers.verify_find_error("VULNERABLE: yes, CWE-787", False, "CWE-787", graph)
+    assert (v.metric, v.dense) == (0, 0)  # a correct CWE earns nothing on the patched function
+
+
+def test_paired_accuracy(graph):
+    vy = verifiers.verify_find_error("VULNERABLE: yes, CWE-787", True, "CWE-787", graph)
+    vy_wrong_cwe = verifiers.verify_find_error("VULNERABLE: yes, CWE-125", True, "CWE-787", graph)
+    pn = verifiers.verify_find_error("VULNERABLE: no", False, "CWE-787", graph)
+    py = verifiers.verify_find_error("VULNERABLE: yes, CWE-787", False, "CWE-787", graph)
+    assert verifiers.paired_accuracy(vy, pn) == 1 and verifiers.paired_cwe_accuracy(vy, pn, "CWE-787") == 1
+    assert verifiers.paired_accuracy(vy_wrong_cwe, pn) == 1 and verifiers.paired_cwe_accuracy(vy_wrong_cwe, pn, "CWE-787") == 0
+    assert verifiers.paired_accuracy(vy, py) == 0  # always "vulnerable" scores 0 paired
+
+
+# --- Line localisation ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("reply, parsed", [
+    ("LINES: 12, 13, 17", [12, 13, 17]),
+    ("LINES: 17, 12, 12", [12, 17]),
+    ("LINES: none", []),
+    ("The bug is CWE-787 on lines 3 and 5.", [3, 5]),            # 787 is out of range and dropped
+    ("Lines 2 and 4 look off. LINES: 7", [7]),                    # only after the last LINES:
+    ("LINES: 12-14", [12, 14]),                                   # no ranges: both endpoints, nothing between
+    ("LINES: 0, 41", []),                                         # integers found but none in range: empty, not a failure
+    ("I don't think any line is involved: none.", []),
+])
+def test_parse_lines(reply, parsed):
+    assert verifiers.parse_lines(reply, 40) == parsed
+
+
+@pytest.mark.parametrize("reply", ["I cannot tell.", "LINES:", ""])
+def test_parse_lines_failures(reply):
+    assert verifiers.parse_lines(reply, 40) is None
+
+
+@pytest.mark.parametrize("reply, strict", [
+    ("LINES: 1, 2, 40", True), ("LINES: none", True), ("LINES: 2, 1", False), ("LINES: 1, 1", False),
+    ("LINES: 41", False), ("lines: 1", False), ("LINES: 1,2", False), ("LINES: 01", False),
+])
+def test_strict_lines(reply, strict):
+    assert verifiers.strict_lines(reply, 40) is strict
+
+
+@pytest.mark.parametrize("pred, gold, f1", [
+    ([11, 12, 13], [12], Fraction(1, 2)),        # tripling the guess costs precision (plan's example)
+    (list(range(1, 41)), [7, 30], Fraction(4, 42)),  # spray-all: ~0.095
+    ([12, 13], [11, 12], Fraction(1)),           # a maximum matching, not exact-hits-first
+    ([12], [12], Fraction(1)),
+    ([13], [12], Fraction(1)),                   # +-1 tolerance
+    ([14], [12], Fraction(0)),
+    ([11, 13], [12], Fraction(2, 3)),            # one gold line is claimed once
+    ([], [12], Fraction(0)),
+    ([5, 6, 7], [4, 6, 8], Fraction(1)),
+])
+def test_line_f1(pred, gold, f1):
+    assert verifiers.line_f1(pred, gold) == f1
+
+
+def test_matcher_is_maximum():
+    import random
+    rng = random.Random(0)
+
+    def brute(pred, gold):  # exhaustive maximum matching within +-1
+        if not pred:
+            return 0
+        p, rest = pred[0], pred[1:]
+        best = brute(rest, gold)
+        for i, g in enumerate(gold):
+            if abs(p - g) <= 1:
+                best = max(best, 1 + brute(rest, gold[:i] + gold[i + 1:]))
+        return best
+
+    for _ in range(500):
+        pred = sorted(rng.sample(range(1, 12), rng.randint(0, 6)))
+        gold = sorted(rng.sample(range(1, 12), rng.randint(1, 6)))
+        assert verifiers.matched_lines(pred, gold) == brute(pred, gold)
+
+
+def test_verify_line_loc():
+    v = verifiers.verify_line_loc("LINES: 12", [12], 40)
+    assert (v.parsed, v.strict_ok, v.metric, v.dense) == ("LINES: 12", True, 1, 1)
+    v = verifiers.verify_line_loc("LINES: none", [12], 40)
+    assert (v.parsed, v.parse_ok, v.metric) == ("LINES: none", True, 0)
+    assert verifiers.verify_line_loc("no idea", [12], 40).parse_ok is False
+    with pytest.raises(ValueError):
+        verifiers.verify_line_loc("LINES: 1", [], 40)
+
+
+def test_new_scores_in_unit_interval(graph):
+    for r in ("ANSWER: A", "B", "x"):
+        v = verifiers.verify_mcq(r, "A")
+        assert 0 <= v.metric <= 1 and 0 <= v.dense <= 1
+    for r in ("VULNERABLE: yes, CWE-787", "VULNERABLE: yes, CWE-20", "VULNERABLE: yes", "VULNERABLE: no", "?"):
+        for vulnerable in (True, False):
+            v = verifiers.verify_find_error(r, vulnerable, "CWE-787", graph)
+            assert 0 <= v.metric <= 1 and 0 <= v.dense <= 1
+    for r in ("LINES: 1, 2, 3", "LINES: none", "LINES: " + ", ".join(map(str, range(1, 41))), "nothing"):
+        v = verifiers.verify_line_loc(r, [2, 9], 40)
+        assert 0 <= v.metric <= 1 and v.metric == v.dense
+
+
+def test_verify_item_dispatch(graph):
+    assert verifiers.verify_item("mcq", "ANSWER: C", {"letter": "C"}, graph).metric == 1
+    assert verifiers.verify_item("exact_id", "CWE-787", {"cwe": "CWE-787"}, graph).metric == 1
+    assert verifiers.verify_item("cvss", GOLD_VEC, {"vector": GOLD_VEC}, graph).metric == 1
+    assert verifiers.verify_item("find_error", "VULNERABLE: no", {"vulnerable": False, "cwe": "CWE-787"}, graph).metric == 1
+    assert verifiers.verify_item("line_loc", "LINES: 3", {"lines": [3], "n_lines": 9}, graph).metric == 1
+    with pytest.raises(ValueError):
+        verifiers.verify_item("explain", "x", {}, graph)

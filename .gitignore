@@ -9,3 +9,9 @@ data/
 data/combined_dataset/facts.jsonl
 data/combined_dataset/candidates.jsonl
 data/combined_dataset/drops.jsonl
+
+# Claude-related files 
+.claude/
+
+# API keys for generators.external (see .env.example)
+.env

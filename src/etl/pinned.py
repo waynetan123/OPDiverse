@@ -1,7 +1,7 @@
-"""Pinned definitions for the OPDiverse fact table, test window and hierarchy scoring.
+"""Pinned definitions for the OPDiverse fact table, test window, hierarchy scoring, probe and question bank.
 
 Everything here can move a census count, a split or a score. It is frozen before step 0: any
-change needs a matching entry in docs/decisions/step{1,2}_decision_record.md. Pure functions,
+change needs a matching entry in docs/decisions/step{1,2,3,4}_decision_record.md. Pure functions,
 stdlib only, no I/O.
 """
 
@@ -90,7 +90,9 @@ EVAL_SAMPLING = {
 EVAL_DTYPE = "bfloat16"
 # Qwen's generation_config lists both as EOS; with that config ignored, the runner stops on both explicitly.
 EVAL_STOP_TOKENS = ("<|im_end|>", "<|endoftext|>")
-EVAL_MAX_MODEL_LEN = 1024  # probe prompts are ~80 tokens; raise for bank evaluation (functions up to 10,000 tokens)
+# The longest question-bank prompt (line localisation, 16,473 tokens) + EVAL_MAX_TOKENS; set at step 4.
+# The probe ran at 1,024 (its prompts are ~80 tokens). `generators bank check` fails if this stops covering the bank.
+EVAL_MAX_MODEL_LEN = 16_985
 # The Qwen2.5 chat template inserts this when no system message is given.
 QWEN_SYSTEM_PROMPT = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
 # Filled in from run_meta.json after the first vLLM run; every later evaluation must match it.
@@ -120,6 +122,97 @@ PROBE_ALPHA = 0.05
 PROBE_PERMUTATIONS = 10_000
 PROBE_BOOTSTRAP = 2_000
 PROBE_SEED = 0
+
+# ---------------------------------------------------------------------------
+# Question bank (step 4)
+# ---------------------------------------------------------------------------
+
+BANK_TEMPLATE_VERSION = "v1"
+BANK_TYPES = ("mcq", "exact_id", "cvss", "find_error", "line_loc")
+ITEMS_PER_CVE = 6  # find_error contributes two: index 0 vulnerable, index 1 patched
+MCQ_LETTERS = "ABCD"
+
+# Every template ends by asking for the answer in the target format, so the same prompt serves
+# arms that answer directly (SFT) and arms that reason first (distill); the parsers read the end.
+BANK_PROMPTS = {
+    "mcq": (
+        "Here is the NVD description of a vulnerability:\n\n{description}\n\n"
+        "Which CWE (Common Weakness Enumeration) weakness does it describe?\n\n{options}\n\n"
+        "End your reply with the letter of the correct option, in the form ANSWER: <letter>."
+    ),
+    "exact_id": (
+        "Here is the NVD description of a vulnerability:\n\n{description}\n\n"
+        "Which CWE (Common Weakness Enumeration) weakness does it describe? "
+        "End your reply with a single CWE ID, in the form CWE-<number>."
+    ),
+    "cvss": (
+        "Here is the NVD description of a vulnerability:\n\n{description}\n\n"
+        "What is its CVSS v3 base vector? "
+        "End your reply with the vector, in the form AV:_/AC:_/PR:_/UI:_/S:_/C:_/I:_/A:_."
+    ),
+    "find_error": (
+        "Here is a C/C++ function:\n\n```c\n{function}\n```\n\n"
+        "Does this function contain a security vulnerability, and if so, which CWE (Common Weakness "
+        "Enumeration) weakness is it? End your reply with VULNERABLE: yes, CWE-<number> or VULNERABLE: no."
+    ),
+    "line_loc": (
+        "Here is the NVD description of a vulnerability:\n\n{description}\n\n"
+        "Here is the vulnerable C/C++ function. Each line starts with its line number, counting from 1, "
+        "then a colon and a space.\n\n```\n{numbered}\n```\n\n"
+        "Which lines does the fix change? A line counts if the fix modifies or deletes it. Code the fix adds "
+        "counts against the nearest code line above it, or the first code line if it is added before all of "
+        "them. Blank and comment-only lines never count. End your reply with the line numbers in ascending "
+        "order, in the form LINES: 12, 13, 17."
+    ),
+}
+MCQ_OPTION = "{letter}. {cwe}: {name}"
+# Literal CWE IDs in a description give the answer away on MCQ and exact-ID; the item's own CVE ID
+# is removed wherever it appears. The stored fact is unchanged.
+CWE_LITERAL = re.compile(r"(?<![A-Za-z0-9])CWE[-_ ]?\d+(?!\d)", re.IGNORECASE)
+CWE_REDACTED = "CWE-[redacted]"
+CVE_REDACTED = "CVE-[redacted]"
+
+# Line localisation trivial baselines.
+LINE_KEYWORDS = ("memcpy", "strcpy", "alloc")  # case-sensitive substrings
+EVERY_KTH_LINE = (2, 3)                          # lines 1, 1+k, 1+2k, ...
+
+# MCQ distractors: the external model proposes, the rules admit, names come from the XML.
+MCQ_DISTRACTORS = 3
+MCQ_REQUEST_MAX = 8
+MCQ_ATTEMPTS = 2                   # the first request plus one regeneration, then the prior-matched draw
+MCQ_PILOT_SIZE = 100
+MCQ_SHORTCUT_MAX = Fraction(1, 2)  # above this on non-test, the prior-matched draw replaces the model's picks
+MCQ_SALTS = {"letter": "mcq-letter", "slot": "mcq-slot", "draw": "mcq-draw", "pilot": "mcq-pilot"}
+MCQ_REQUEST_PROMPT = (
+    "I am building a multiple-choice question for a benchmark that tests whether a model can classify a "
+    "vulnerability from its description. The question shows the description below and four CWE options. "
+    "One option is the correct answer; I need the other three.\n\n"
+    "Description:\n{description}\n\n"
+    "Correct answer: {cwe}: {name}\n\n"
+    "List up to {n} CWE IDs that would make good wrong options, ordered from most to least plausible. Each "
+    "should be tempting to someone reading the description, but wrong once the description is read "
+    "carefully. Prefer weaknesses that commonly occur in C and C++ code. Do not include the correct answer, "
+    "and do not include any weakness that is a more general or a more specific version of it (its ancestors "
+    "or descendants under ChildOf in the CWE-1000 Research Concepts view), because those would also be "
+    "defensible answers. Use weakness IDs from CWE release {release} only, not categories or views, "
+    "written as CWE-<number>."
+)
+MCQ_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {"distractors": {"type": "array", "items": {"type": "string"}}},
+    "required": ["distractors"],
+    "additionalProperties": False,
+}
+
+# The external model (steps 4 and 6): one model, one configuration, every external job. No dated
+# snapshot exists and sampling cannot be set, so its outputs are cached and audited, not regenerated.
+EXTERNAL_MODEL = {
+    "provider": "anthropic",
+    "model": "claude-opus-5-5",
+    "effort": "medium",
+    "max_tokens": 16_000,
+    "thinking": {"type": "adaptive"},
+}
 
 # Deprecated CWE-1000 weaknesses -> replacement, read from each entry's Description in the
 # 4.20 XML. A replacement is recorded only where MITRE names exactly one successor; None

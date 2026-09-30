@@ -10,7 +10,13 @@ The secondary question — and the one that makes the result non-trivial — is 
 
 **Backbone.** A Qwen-family 7B instruct checkpoint, named and version-pinned in-repo. One backbone for every arm.
 
-**External model.** A single named, version-pinned external LLM supplies distill-external's reasoning traces and every DPO rejected completion, and stands as the substitution source for distill-self if its self-generated rationales fail the quality bar. One model, one version, three jobs — so that any finding about externally-sourced data is a finding about one identified system rather than an unspecified mixture.
+**External model.** A single named external LLM, Claude Opus 5.5 (`claude-opus-5-5`, effort `medium`), does four jobs:
+- chooses the MCQ distractors;
+- supplies distill-external's reasoning traces;
+- writes every DPO rejected completion;
+- stands as the substitution source for distill-self if its self-generated rationales fail the quality bar.
+
+One model, one configuration, four jobs, so that any finding about externally sourced data is a finding about one identified system rather than an unspecified mixture. It has no dated snapshot and accepts no sampling parameters. Its outputs are therefore cached and audited rather than regenerated. Pins are in `docs/decisions/step4_decision_record.md`.
 
 ## Architecture
 
@@ -72,7 +78,7 @@ Six workloads in this experiment generate text, and generation — not backpropa
 
 Generation has two phases. **Prefill** reads the prompt, processing all tokens in parallel — fast per token, and a shape GPUs handle well. **Decode** writes the answer one token at a time, each token requiring the full model weights to be re-read from memory; on an A40 that is bounded by ~696 GB/s of memory bandwidth, not by arithmetic.
 
-This experiment's workload is prefill-heavy and decode-light: prompts are long (a whole C function, median ~800 tokens and up to 10,000) and answers are tiny (`LINES: 12, 13, 17` is about 15 tokens). That is the shape where naive generation wastes the most, and where vLLM's three mechanisms pay off hardest.
+This experiment's workload is prefill-heavy and decode-light. Half the items per CVE are long, because find-the-error and line localisation carry a whole C function (median ~900 and ~1,300 prompt tokens, up to 10,000 and 16,500). The label types carry only the description (~130–190 tokens). Answers are tiny (`LINES: 12, 13, 17` is about 15 tokens). That is the shape where naive generation wastes the most, and where vLLM's three mechanisms pay off hardest.
 
 |Mechanism|What it fixes|
 |---|---|
@@ -91,7 +97,7 @@ For an 800-token function (roughly the fact-table median) generating 8 rollouts 
 |Rollout sampling|One sampling config (temperature, top-p) used identically for GRPO training rollouts and for the signal audit|
 |Rollout / audit caps|Per-type `max_new_tokens`: MCQ 16, exact-ID 24, CVSS 48, find-the-error 64, line localisation 64, with per-type stop sequences|
 |**Evaluation caps**|**512 tokens, uniform across all arms and types**|
-|External model|One named model and version for distill-external traces, DPO negatives, and the distill-self substitution source|
+|External model|Claude Opus 5.5, effort `medium`, for MCQ distractors, distill-external traces, DPO negatives, and the distill-self substitution source|
 
 **Why evaluation caps are uniform and generous.** Tight caps are correct for GRPO rollouts, where the model is being trained toward terse answers and every arm sees the same cap on the same untrained base. They are wrong at evaluation, because distill-self and distill-external are trained to reason before answering. A 24-token evaluation cap would truncate those arms while leaving SFT intact — an efficiency setting that silently penalises specific arms and would be read as an objective effect. Decode is cheap when a model stops early, so a 512 cap costs little and binds only on the arms that must not be truncated.
 
@@ -108,7 +114,7 @@ For an 800-token function (roughly the fact-table median) generating 8 rollouts 
 
 Because the pool is _all_ non-test items rather than one seed's train set, this file is generated once and every seed's partition reads from it. That is the entire reason the ordering was changed.
 
-**2. External-model jobs.** distill-external traces (~20,000) and DPO rejected completions (~20,000) run against the pinned external model over the same frozen non-test item pool. Both produce static files, cached to disk, generated once and reused across every seed and matrix. Version-pin the model, archive the generation prompts, and record request-level metadata so the files can be regenerated identically.
+**2. External-model jobs.** distill-external traces (~20,000) and DPO rejected completions (~20,000) run against the pinned external model over the same frozen non-test item pool. Both produce static files, cached to disk, generated once and reused across every seed and matrix. Pin the model and its configuration, archive the generation prompts, and record request-level metadata so the files can be audited. They cannot be regenerated identically, because the model has no dated snapshot and no sampling control, so the cached files are the artifact.
 
 **3. GRPO rollouts.** TRL `GRPOTrainer` with `use_vllm=True`, `num_generations=8` (which becomes `n=8` with prefix sharing), per-type completion caps, and `gpu_memory_utilization` tuned against OOM. Deployment mode — `colocate` (all four cards run full GRPO jobs) versus `server` (one card serves inference, three train) — is decided by measurement on a single pilot run, not by assumption. Colocate is the likely choice on 4×A40, since a 7B in bf16 is 14GB and the workload is ~24 independent GRPO runs that parallelise trivially across cards.
 
@@ -219,6 +225,13 @@ Five types per fact, six prompts per fact, one prompt template each. All generat
 
 Generated **once**, after the test window is drawn: one pass over the non-test pool, one pass over the test pool, both frozen before any generated artifact or any seed partition exists.
 
+**What each prompt shows.** The context is split by source, and no prompt shows the CVE ID:
+- MCQ, exact-ID and CVSS see the NVD description only;
+- find-the-error sees the bare function only;
+- line localisation sees the description and the numbered vulnerable function.
+
+Literal CWE IDs in a description, and the CVE's own ID anywhere, are redacted. Every template ends "End your reply with … in the form …", so one byte-identical prompt serves arms that answer directly and arms that reason first. Templates, targets and parsers are pinned in `docs/decisions/step4_decision_record.md`.
+
 |Type|Prompts per CVE|Prompt|Eval metric|Training score (verifier-consuming arms only)|
 |---|---|---|---|---|
 |MCQ|1|which CWE, four lettered options|parsed letter, exact match|binary; chance 25% gives natural spread|
@@ -235,7 +248,11 @@ This creates a real asymmetry: GRPO's training signal is dense where its eval me
 
 **MCQ interface.** Scored by generating a letter, not by ranking option likelihoods. Likelihood ranking is not a function of a sampled completion, so no generation-based objective can optimise it; training one interface and evaluating another would measure the mismatch and attribute it to the objective. Length-normalised log-likelihood ranking is retained as a secondary diagnostic on all arms, never trained against. Read together: high rank with low letter accuracy is knowledge without format; low rank with high letter accuracy is a decoding habit without a shift in belief.
 
-**MCQ construction.** Distractors drawn from the fact table's sibling-CWE field. Options generated once and frozen, so every arm and every seed sees identical option sets.
+**MCQ construction.** The external model proposes the distractors and fixed rules decide which are admitted. Options are generated once and frozen, so every arm and every seed sees identical option sets.
+- **Why not the sibling field.** An earlier draft drew distractors from the fact table's sibling-CWE field. On non-test that lets "pick the option that is most often a gold label" score 0.895 against a chance rate of 0.25. SFT could learn that label prior faster than GRPO and manufacture an arm × type interaction.
+- **Admission.** A distractor must be a live CWE-1000 weakness. It must not be gold and must not be an ancestor or descendant of gold, since either would be a second defensible answer. Option names come from the MITRE XML.
+- **Gaps.** One regeneration, then a draw weighted by non-test gold frequency fills any missing slot.
+- **Pre-registered guard.** If the most-familiar-option shortcut exceeds 0.5 on non-test, every MCQ item is rebuilt from that draw alone. The draw scores 0.348.
 
 **Gold letter assignment.** Assigned by a deterministic hash of the CVE ID into {A, B, C, D}, fixed at bank-generation time. The earlier pin — "balanced at exactly 25% per letter within each split" — is retired because it is incompatible with freezing options before splits exist, and per-seed rebalancing would make MCQ a different item between M1 and M2, which is exactly the comparison the matrices rest on. Hashing gives 25% per letter in expectation and approximately within any large subset. **Report the realised per-letter marginals per split** as a check; the "always A" baseline catches the failure if a split comes out skewed.
 
@@ -261,7 +278,7 @@ Step 3 does real work: without it, a response mentioning CWE-787 contributes 787
 - Gold `{12}`, prediction `{11, 12, 13}` → precision 3/3, recall 1/1, **F1 = 1.0**. Tripling the guess costs nothing.
 - Gold of 2, prediction of all 40 → up to 6 fall inside the windows, giving F1 ≈ 0.26, not the 0.095 the anti-spray argument relies on.
 
-The pinned matcher builds a maximum matching where **each gold line may be claimed by at most one prediction and vice versa**. Exact hits first; remaining predictions matched at distance 1, ties broken by lowest line number. TP is matched pairs; precision TP/|predicted|, recall TP/|gold|. Under it, `{11, 12, 13}` against `{12}` gives F1 = 0.5 and spray-all returns to 0.095. The identical matcher runs in the GRPO reward and in evaluation.
+The pinned matcher builds a maximum matching where **each gold line may be claimed by at most one prediction and vice versa**. Among maximum matchings it prefers the most exact hits, then the lowest line numbers. That tie-break decides which pairs are matched, never how many. Matching exact hits first and then greedily at distance 1 is *not* equivalent: gold {11, 12} against prediction {12, 13} scores 0.5 that way and 1.0 under the maximum matching. TP is matched pairs; precision TP/|predicted|, recall TP/|gold|. Under it, `{11, 12, 13}` against `{12}` gives F1 = 0.5 and spray-all returns to 0.095. The identical matcher runs in the GRPO reward and in evaluation.
 
 **All five parsers** are tuned against dev outputs only, never test, and frozen before test is touched. Leniency is worth several points if tuned after seeing results. The same parser runs on every arm, base especially, since base will answer in prose. Every score is also reported under a strict parser as a robustness column; disagreement on arm ordering is a finding about format sensitivity, not a bug.
 
@@ -293,7 +310,7 @@ The prompt is byte-identical across all arms. Only what sits beside it changes. 
 |Distill-self|primary|prompt + own hint-conditioned rationales|base model writes a rationale _given the gold answer_; rationale + gold answer is the target|
 |DPO-from-base|primary|prompt + chosen/rejected|chosen is gold; rejected written by the external model in identical format|
 |GRPO|primary|prompt + verifier|k=8 rollouts, dense reward, group-normalised advantage|
-|Distill-external|secondary|prompt + external traces|full chain-of-thought from the external model|
+|Distill-external|secondary|prompt + external traces|written-out reasoning from the external model|
 |SFT→DPO|secondary|prompt + chosen/rejected|DPO initialised from the SFT checkpoint|
 
 Base, SFT and both distill arms never touch a verifier for data selection. Every shaping decision lands in DPO and GRPO only. No converter can delete a row from another converter's file.
@@ -325,7 +342,7 @@ _What it costs, stated plainly._ A substituted column is no longer independent o
 
 **distill-external** uses the same external model to generate unhinted traces in the ordinary way, reported descriptively, never in the interaction test. A strong teacher makes the row carry two explanations at once, which cannot be separated, and a contaminated row distorts the interaction statistic for all four arms rather than only its own cell. The gap between the two distill arms bounds how much of the benefit is teacher capability rather than the presence of reasoning in the target — a bound that becomes uninformative for any substituted type, which is another reason to record substitution per type.
 
-Prefer an open-weight reasoning model exposing its full chain-of-thought; summarised traces are a different object and a reviewer will flag distillation on them. Name the model and version. Report the dense-score distribution of external traces per type as a covariate.
+A summarised trace is a different object from a full one, and a reviewer will flag distillation on it. The pinned external model, Claude Opus 5.5, never returns its hidden reasoning, so a trace here is the reasoning the model writes out in its reply before the answer. The owner has permission to request this. The write-up calls it written-out reasoning, not raw chain-of-thought. Report the dense-score distribution of external traces per type as a covariate.
 
 ### DPO — initialisation, reference policy, negatives
 
@@ -390,7 +407,7 @@ State the configuration count per arm in the paper.
 1. **Build the fact table**, apply all pinned definitions, report the filtering census including the **v3.x publication-year histogram**. Apply the time-range gate and record the decision. Compute the constant-answer hierarchy baseline and fix the exact-ID credit schedule. Run the CVSS version-parity check.
 2. **Draw the frozen test window:** chronologically latest 15%, by publication date. Verify no CVE ID or near-duplicate function crosses the boundary. Report N moved.
 3. **Contamination probe** on the raw backbone, over 300 CVEs from the drawn test window. Record the result and the decision-rule outcome.
-4. **Generate the question bank, once.** One pass over the whole non-test pool, one pass over the test pool. Six items per CVE. MCQ options frozen, gold letters assigned by CVE-ID hash; report realised per-letter marginals per pool. Freeze the bank.
+4. **Generate the question bank, once.** One pass over the whole non-test pool, one pass over the test pool. Six items per CVE. MCQ distractors proposed by the external model and admitted by rule, with the shortcut guard applied. Options frozen, gold letters assigned by CVE-ID hash; report realised per-letter marginals per pool. Freeze the bank.
 5. **Frozen-model vLLM session:** run the per-arm signal audit on non-test items; generate distill-self hint-conditioned rationales over the **whole non-test pool**; cache to disk keyed by `(CVE ID, type, item index)`. Evaluate the **substitution trigger** per type and record which types, if any, will draw rationales from the external model.
 6. **External-model jobs:** generate distill-external traces and all DPO rejected completions over the whole non-test pool, plus substituted distill-self rationales where triggered. Validate every rejection against its per-type rule; regenerate once, then rule-construct. Cache all outputs; report rule-fallback rates. Do not proceed until the audit, substitution decisions and fallback rates are recorded.
 7. Run the **engine-agreement check** (HF versus vLLM on one checkpoint, dev only). Freeze the primary-test implementation.

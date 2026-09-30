@@ -1,0 +1,3 @@
+# External-model machine only, for `python -m generators.external` (steps 4 and 6).
+# Record the installed version in the run_meta.json it writes.
+anthropic

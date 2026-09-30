@@ -10,7 +10,8 @@ Each verifier parses, then scores.
   [0, 1] and both are 0 when the lenient parser fails.
 
 Parsers are tuned on dev outputs only, never test; bump PARSER_VERSION on any change.
-MCQ, find-the-error and line localisation are added with the question bank (step 4).
+MCQ, find-the-error and line localisation were added with the question bank (step 4), before
+v1 had scored any bank output, so the version stays v1.
 """
 
 from __future__ import annotations
@@ -110,4 +111,194 @@ def verify_cvss(reply: str, gold: str) -> Verdict:
     )
 
 
-VERIFIERS = {"exact_id": verify_exact_id, "cvss": verify_cvss}
+# ---------------------------------------------------------------------------
+# MCQ: target "ANSWER: B"
+# ---------------------------------------------------------------------------
+
+_MCQ_ANSWER = re.compile(r"(?i:ANSWER)\s*:\s*[(\[*]*\s*([A-D])(?![A-Za-z0-9])")
+_MCQ_LONE = re.compile(r"[\s(\[*]*([A-D])[\s).\]*]*")
+_MCQ_FALLBACK = re.compile(r"\(([A-D])\)|\b(?:option|answer is)\s+([A-D])(?![A-Za-z0-9])", re.IGNORECASE)
+_MCQ_STRICT = re.compile(r"ANSWER: [A-D]")
+
+
+def parse_mcq(reply: str) -> str | None:
+    """The capital letter after the last ANSWER:, else a reply that is one letter, else the last
+    (X) / 'option X' / 'answer is X'. Letters must be capitals, so 'answer: a buffer overflow'
+    is not read as A."""
+    if found := _MCQ_ANSWER.findall(reply):
+        return found[-1].upper()
+    if m := _MCQ_LONE.fullmatch(reply):
+        return m.group(1)
+    found = [a or b for a, b in _MCQ_FALLBACK.findall(reply)]
+    found = [f for f in found if f in pinned.MCQ_LETTERS]
+    return found[-1] if found else None
+
+
+def strict_mcq(reply: str) -> bool:
+    return _MCQ_STRICT.fullmatch(reply.strip()) is not None
+
+
+def verify_mcq(reply: str, gold: str) -> Verdict:
+    parsed = parse_mcq(reply)
+    if parsed is None:
+        return _FAILED
+    score = Fraction(parsed == gold)
+    return Verdict(parsed=parsed, parse_ok=True, strict_ok=strict_mcq(reply), metric=score, dense=score)
+
+
+# ---------------------------------------------------------------------------
+# Find-the-error: target "VULNERABLE: yes, CWE-787" or "VULNERABLE: no"
+# ---------------------------------------------------------------------------
+
+_FE_FIELD = re.compile(r"VULNERABLE\s*:\s*\**\s*(yes|no)(?![A-Za-z])", re.IGNORECASE)
+_FE_NEGATIVE = re.compile(
+    r"\b(?:not|isn't|is\s+not|no\s+longer)\s+vulnerable\b|\bno\s+(?:known\s+|security\s+)?vulnerabilit(?:y|ies)\b",
+    re.IGNORECASE,
+)
+_FE_POSITIVE = re.compile(r"\bvulnerab(?:le|ilit(?:y|ies))\b", re.IGNORECASE)
+_FE_STRICT = re.compile(r"VULNERABLE: (?:yes, CWE-[1-9]\d*|no)")
+
+
+def parse_find_error(reply: str) -> tuple[bool | None, str | None]:
+    """(vulnerable?, CWE or None). The label is the yes/no after the last VULNERABLE:; without
+    that field, the last vulnerability statement in the reply decides, negations checked first."""
+    if found := _FE_FIELD.findall(reply):
+        label = found[-1].lower() == "yes"
+    else:
+        negatives = [m.span() for m in _FE_NEGATIVE.finditer(reply)]
+        events = [(s, False) for s, _ in negatives]
+        events += [(m.start(), True) for m in _FE_POSITIVE.finditer(reply)
+                   if not any(s <= m.start() < e for s, e in negatives)]
+        if not events:
+            return None, None
+        label = max(events)[1]
+    return label, parse_cwe(reply) if label else None
+
+
+def strict_find_error(reply: str) -> bool:
+    return _FE_STRICT.fullmatch(reply.strip()) is not None
+
+
+def verify_find_error(reply: str, vulnerable: bool, gold_cwe: str, graph: pinned.CweLookup) -> Verdict:
+    """Per-function score. Vulnerable prompt: 0.5*label + 0.5*label*hierarchy credit. Patched
+    prompt: label. `metric` is per-function label accuracy; paired accuracy is paired_accuracy()."""
+    label, cwe = parse_find_error(reply)
+    if label is None:
+        return _FAILED
+    correct = Fraction(label == vulnerable)
+    if vulnerable:
+        credit = pinned.hierarchy_score(cwe, gold_cwe, graph) if cwe else Fraction(0)
+        dense = correct / 2 + correct * credit / 2
+    else:
+        dense = correct
+    parsed = "VULNERABLE: no" if not label else f"VULNERABLE: yes, {cwe}" if cwe else "VULNERABLE: yes"
+    return Verdict(parsed=parsed, parse_ok=True, strict_ok=strict_find_error(reply), metric=correct, dense=dense)
+
+
+def paired_accuracy(vulnerable: Verdict, patched: Verdict) -> Fraction:
+    """The headline find-the-error score for one CVE: both functions labelled correctly."""
+    return Fraction(vulnerable.metric == 1 and patched.metric == 1)
+
+
+def paired_cwe_accuracy(vulnerable: Verdict, patched: Verdict, gold_cwe: str) -> Fraction:
+    """The stricter column: both labels right and the vulnerable function's CWE exactly right."""
+    return Fraction(paired_accuracy(vulnerable, patched) == 1 and vulnerable.parsed == f"VULNERABLE: yes, {gold_cwe}")
+
+
+# ---------------------------------------------------------------------------
+# Line localisation: target "LINES: 12, 13, 17" or "LINES: none"
+# ---------------------------------------------------------------------------
+
+_LINES_FIELD = re.compile(r"LINES\s*:", re.IGNORECASE)
+_LINES_NONE = re.compile(r"\bnone\b", re.IGNORECASE)
+_LINES_STRICT = re.compile(r"LINES: (?:none|[1-9]\d*(?:, [1-9]\d*)*)")
+
+
+def parse_lines(reply: str, n_lines: int) -> list[int] | None:
+    """The plan's parser: text after the last LINES: (else the whole reply) -> every integer ->
+    drop those outside [1, n_lines] -> dedupe and sort. Integers found (even if all dropped) or a
+    literal 'none' parse; neither is a failure."""
+    fields = list(_LINES_FIELD.finditer(reply))
+    tail = reply[fields[-1].end():] if fields else reply
+    numbers = [int(x) for x in re.findall(r"\d+", tail)]
+    if not numbers:
+        return [] if _LINES_NONE.search(tail) else None
+    return sorted({x for x in numbers if 1 <= x <= n_lines})
+
+
+def strict_lines(reply: str, n_lines: int) -> bool:
+    text = reply.strip()
+    if _LINES_STRICT.fullmatch(text) is None:
+        return False
+    if text == "LINES: none":
+        return True
+    numbers = [int(x) for x in text[len("LINES: "):].split(", ")]
+    return numbers == sorted(set(numbers)) and numbers[-1] <= n_lines
+
+
+def matched_lines(predicted: list[int], gold: list[int]) -> int:
+    """Size of a maximum one-to-one matching in which a prediction may claim a gold line at most
+    1 away. Each prediction p is the interval [p-1, p+1]; taking predictions in ascending order and
+    giving each the lowest unclaimed gold line in its interval is optimal. Among maximum matchings
+    the pin prefers the most exact hits, then the lowest lines; that choice changes which pairs are
+    matched, never how many, so F1 does not depend on it."""
+    gold = sorted(set(gold))
+    j = matched = 0
+    for p in sorted(set(predicted)):
+        while j < len(gold) and gold[j] < p - 1:
+            j += 1
+        if j < len(gold) and gold[j] <= p + 1:
+            matched += 1
+            j += 1
+    return matched
+
+
+def line_f1(predicted: list[int], gold: list[int]) -> Fraction:
+    if not gold:
+        raise ValueError("gold line set is empty; step 1 drops empty patches")
+    if not predicted:
+        return Fraction(0)
+    tp = matched_lines(predicted, gold)
+    return Fraction(2 * tp, len(set(predicted)) + len(set(gold)))
+
+
+def verify_line_loc(reply: str, gold: list[int], n_lines: int) -> Verdict:
+    parsed = parse_lines(reply, n_lines)
+    if parsed is None:
+        return _FAILED
+    score = line_f1(parsed, gold)
+    return Verdict(
+        parsed="LINES: " + (", ".join(map(str, parsed)) if parsed else "none"),
+        parse_ok=True,
+        strict_ok=strict_lines(reply, n_lines),
+        metric=score,
+        dense=score,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Registry and bank dispatch
+# ---------------------------------------------------------------------------
+
+VERIFIERS = {
+    "mcq": verify_mcq,
+    "exact_id": verify_exact_id,
+    "cvss": verify_cvss,
+    "find_error": verify_find_error,
+    "line_loc": verify_line_loc,
+}
+
+
+def verify_item(item_type: str, reply: str, gold: dict, graph: pinned.CweLookup) -> Verdict:
+    """Score a reply to a question-bank item from the item's `gold` field."""
+    if item_type == "mcq":
+        return verify_mcq(reply, gold["letter"])
+    if item_type == "exact_id":
+        return verify_exact_id(reply, gold["cwe"], graph)
+    if item_type == "cvss":
+        return verify_cvss(reply, gold["vector"])
+    if item_type == "find_error":
+        return verify_find_error(reply, gold["vulnerable"], gold["cwe"], graph)
+    if item_type == "line_loc":
+        return verify_line_loc(reply, gold["lines"], gold["n_lines"])
+    raise ValueError(f"unknown item type {item_type!r}")

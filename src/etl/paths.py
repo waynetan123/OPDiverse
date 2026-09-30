@@ -1,4 +1,4 @@
-"""Input and output locations for step 1, all derived from one data directory."""
+"""Input and output locations for every step, all derived from one data directory."""
 
 from __future__ import annotations
 
@@ -125,6 +125,20 @@ class Paths:
     @property
     def probe_report_md(self) -> Path:
         return self.probe / "report.md"
+
+    # Step 4: question bank (file names are in generators.bank.files, shared by the frozen and dry runs)
+    @property
+    def bank(self) -> Path:
+        return self.data / "bank"
+
+    @property
+    def bank_pilot(self) -> Path:
+        return self.bank / "pilot"
+
+    @property
+    def bank_dry(self) -> Path:
+        """--dry-mcq output: MCQ options from the prior-matched draw only, never frozen."""
+        return self.bank / "dry"
 
 
 DEFAULT = Paths(ROOT / "data")

@@ -9,6 +9,7 @@ from .. import external
 from . import mcq
 from .build import load_inputs
 from .files import BankFiles
+from ..progress import track
 
 
 def prepare_mcq(paths: Paths, pilot: bool = False, retry: bool = False) -> tuple[BankFiles, list[dict]]:
@@ -20,14 +21,14 @@ def prepare_mcq(paths: Paths, pilot: bool = False, retry: bool = False) -> tuple
             raise SystemExit("the pilot is never regenerated")
         first = {r["custom_id"]: r for r in read_jsonl(files.mcq_generations)}
         rows = []
-        for f in facts:
+        for f in track(facts, "MCQ retry requests"):
             status, proposals = mcq.parse_generation(first.get(external.custom_id(f"{f['cve_id']}:mcq:0", 1)))
             if mcq.needs_retry(status, mcq.admit(proposals, f["cwe"], graph)[0]):
                 rows.append(mcq.request_row(f, pool_of[f["cve_id"]], graph, attempt=2))
         path = files.mcq_retry_requests
     else:
         chosen = mcq.pilot_sample(facts, pool_of) if pilot else facts
-        rows = [mcq.request_row(f, pool_of[f["cve_id"]], graph, attempt=1) for f in chosen]
+        rows = [mcq.request_row(f, pool_of[f["cve_id"]], graph, attempt=1) for f in track(chosen, "MCQ requests")]
         path = files.mcq_requests
     external.check_request_pins(rows)
     body = jsonl_bytes(rows)

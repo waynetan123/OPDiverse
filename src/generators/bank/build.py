@@ -21,6 +21,9 @@ from etl.tokens import TokenCounter
 from .. import external
 from . import items, mcq
 from .files import BankFiles
+from ..progress import Bar, track
+
+TOKEN_CHUNK = 500  # prompts per tokenizer call; only sets the progress granularity
 
 
 def templates_sha256() -> str:
@@ -48,7 +51,7 @@ def model_decisions(facts: list[dict], split: dict[str, dict], graph: CweGraph, 
     first, retry = _by_custom_id(files.mcq_generations), _by_custom_id(files.mcq_retry_generations)
     counts = mcq.gold_counts(facts, {c: s["pool"] for c, s in split.items()})
     decisions, pending = [], []
-    for f in facts:
+    for f in track(facts, "MCQ options (model)"):
         iid = items.item_id(f["cve_id"], "mcq")
         row1 = first.get(external.custom_id(iid, 1))
         if row1 is None:
@@ -72,7 +75,7 @@ def build(paths: Paths, tokens: TokenCounter, dry: bool = False) -> dict:
     facts, split, graph = load_inputs(paths)
     pool_of = {c: s["pool"] for c, s in split.items()}
     counts = mcq.gold_counts(facts, pool_of)
-    draw = [mcq.draw_only(f, pool_of[f["cve_id"]], counts, graph) for f in facts]
+    draw = [mcq.draw_only(f, pool_of[f["cve_id"]], counts, graph) for f in track(facts, "MCQ options (draw)")]
     shortcut_draw = mcq.shortcut(draw, counts)
     if dry:
         decisions, guard = draw, {"mode": "dry", "shortcut_draw": str(shortcut_draw)}
@@ -88,14 +91,18 @@ def build(paths: Paths, tokens: TokenCounter, dry: bool = False) -> dict:
                 d["discarded_model_decision"] = {k: p[k] for k in ("attempts", "distractors", "sources")}
 
     rows = {pool: [] for pool in POOLS}
-    for f, d in zip(facts, decisions):
+    for f, d in track(list(zip(facts, decisions)), "Question items"):
         s = split[f["cve_id"]]
         options, letter = mcq.layout(f["cve_id"], f["cwe"], d["distractors"], graph)
         d["gold_letter"] = letter
         rows[s["pool"]] += items.build_items(f, s["pool"], s["cluster_id"], options, letter)
-    for pool_rows in rows.values():
-        for row, n in zip(pool_rows, tokens.count([r["prompt"] for r in pool_rows])):
-            row["prompt_tokens"] = n
+    for pool, pool_rows in rows.items():
+        with Bar(f"Token counts ({pool})", len(pool_rows)) as bar:
+            for start in range(0, len(pool_rows), TOKEN_CHUNK):
+                part = pool_rows[start:start + TOKEN_CHUNK]
+                for row, n in zip(part, tokens.count([r["prompt"] for r in part])):
+                    row["prompt_tokens"] = n
+                bar.advance(len(part))
 
     sources = {"facts_sha256": file_sha256(paths.facts), "split_sha256": file_sha256(paths.split),
                "templates_sha256": templates_sha256(), "tokenizer_sha256": tokens.sha256}

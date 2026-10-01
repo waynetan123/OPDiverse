@@ -20,6 +20,7 @@ from etl.verify_sheet import git_gold
 from . import mcq
 from .build import load_inputs
 from .files import BankFiles
+from ..progress import track
 
 
 def _mean(values: list[Fraction]) -> float:
@@ -130,7 +131,7 @@ def git_section(facts: list[dict]) -> dict:
     kinds: Counter = Counter()
     rd_agree = 0
     f1s: list[Fraction] = []
-    for f in facts:
+    for f in track(facts, "git cross-check"):
         g = git_gold(f["vuln_func"], f["patched_func"])
         if g is None:
             kinds["unavailable"] += 1

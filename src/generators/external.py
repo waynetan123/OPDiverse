@@ -31,6 +31,7 @@ from etl.manifest import git_state
 from etl.paths import ROOT
 
 from .bank.files import generations_for, run_meta_for
+from .progress import Bar, track
 
 CUSTOM_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 ENV_FILE = ROOT / ".env"
@@ -182,6 +183,35 @@ def summarise(rows: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def finished(counts) -> int:
+    """Requests the batch is done with, whatever their outcome."""
+    return sum(getattr(counts, k, 0) or 0 for k in ("succeeded", "errored", "canceled", "expired"))
+
+
+def progress_note(batch) -> str:
+    c = batch.request_counts
+    note = f"{batch.processing_status}: {c.succeeded:,} ok"
+    failed = (c.errored or 0) + (c.canceled or 0) + (c.expired or 0)
+    return note + (f", {failed:,} failed" if failed else "")
+
+
+def wait_for_batch(client, batch_id: str, total: int, label: str = "batch", poll_seconds: int = POLL_SECONDS, sleep=time.sleep):
+    """Poll until the batch ends, with a progress bar. The API is asked once per poll_seconds; the
+    bar redraws every second in between so the clock keeps moving. Without a terminal, one status
+    line is printed per poll instead."""
+    with Bar(label, total) as bar:
+        while True:
+            batch = client.messages.batches.retrieve(batch_id)
+            bar.update(finished(batch.request_counts), note=progress_note(batch))
+            if not bar.enabled:
+                print(f"  {progress_note(batch)} ({finished(batch.request_counts):,}/{total:,} done)", flush=True)
+            if batch.processing_status == "ended":
+                return batch
+            for _ in range(poll_seconds):
+                sleep(1)
+                bar.refresh()
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m generators.external", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -201,17 +231,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.resume:
         batch_id = args.resume
     else:
+        print(f"submitting {len(requests)} requests ...")
         batch = client.messages.batches.create(
             requests=[{"custom_id": r["custom_id"], "params": r["params"]} for r in requests])
         batch_id = batch.id
         # Written before polling so an interrupted run can be resumed with --resume.
         args.requests.with_name(args.requests.stem + ".batch_id").write_text(batch_id + "\n", encoding="utf-8")
     print(f"batch {batch_id}: {len(requests)} requests")
-    while (batch := client.messages.batches.retrieve(batch_id)).processing_status != "ended":
-        print(f"  {batch.processing_status}: {_plain(batch.request_counts)}")
-        time.sleep(POLL_SECONDS)
-
-    rows = sorted((result_row(r) for r in client.messages.batches.results(batch_id)), key=lambda r: r["custom_id"])
+    job = args.requests.stem.removesuffix("_requests")  # mcq, mcq_retry, ...
+    batch = wait_for_batch(client, batch_id, len(requests), label=f"{job} batch")
+    results = track(client.messages.batches.results(batch_id), f"{job} results", total=len(requests))
+    rows = sorted((result_row(r) for r in results), key=lambda r: r["custom_id"])
     wanted = {r["custom_id"] for r in requests}
     got = {r["custom_id"] for r in rows}
     if got != wanted:

@@ -16,6 +16,7 @@ from probe.prompts import render_qwen_chat
 from . import items, mcq
 from .build import load_inputs, templates_sha256
 from .files import BankFiles
+from ..progress import track
 
 _OPTION_LINE = re.compile(r"[A-D]\. CWE-\d+: ")
 
@@ -60,13 +61,13 @@ def check(paths: Paths, dry: bool = False) -> list[str]:
         if src.get(k) != v:
             bad.append(f"bank_meta.json {k} does not match the current file")
 
-    for f in facts:
+    for f in track(facts, "Check line numbering"):
         bad += line_numbering(f)
 
     seen: set[str] = set()
     per_cve: Counter = Counter()
     for pool in POOLS:
-        for row in read_jsonl(files.bank(pool)):
+        for row in track(read_jsonl(files.bank(pool)), f"Check items ({pool})"):
             iid, cve, t = row["item_id"], row["cve_id"], row["type"]
             fact, s = by_cve.get(cve), split.get(cve)
             if fact is None:

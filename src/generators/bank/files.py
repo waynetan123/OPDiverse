@@ -75,5 +75,10 @@ def generations_for(requests: Path) -> Path:
     return requests.with_name(requests.name.replace("requests.jsonl", "generations.jsonl"))
 
 
+def partial_for(requests: Path) -> Path:
+    """mcq_requests.jsonl -> mcq_generations.partial.jsonl, the runner's checkpoint while it runs."""
+    return requests.with_name(requests.name.replace("requests.jsonl", "generations.partial.jsonl"))
+
+
 def run_meta_for(requests: Path) -> Path:
     return requests.with_name(requests.name.replace("requests.jsonl", "run_meta.json"))

@@ -6,8 +6,8 @@ it never touches an output file: builds stay byte-identical with or without it.
     for f in track(facts, "MCQ options"):
         ...
 
-    with Bar("MCQ batch", total=2276) as bar:
-        bar.update(done, note="in_progress")
+    with Bar("mcq", total=2276) as bar:
+        bar.update(done, note="3 failed, will be re-sent")
 """
 
 from __future__ import annotations

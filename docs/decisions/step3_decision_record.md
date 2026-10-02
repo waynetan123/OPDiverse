@@ -85,3 +85,5 @@ From `data/probe/report.md` and `report.json`. Generations sha256 `78788b6e…fe
 
 - **`watermarking=True` in the recorded `SamplingParams`.** The runner doesn't set it, and it isn't pinned. Before `pinned.VLLM_VERSION = "0.30.0"` is fixed for every later evaluation, confirm what this does in vLLM 0.30.0 and whether it alters greedy token choice. If it does, disable it explicitly in `EVAL_SAMPLING` and record the change here. It may also be behind the determinism mismatches.
 - **`pinned.VLLM_VERSION`** is still `None`. Set it once the watermarking question is settled.
+
+*Step 5:* `pinned.VLLM_VERSION` is now `"0.30.0"`. Every later runner sets `watermarking=False` explicitly wherever the field exists, rather than relying on its default; `frozen_model.run_vllm --check-only` prints the vLLM source that defines it, recorded in `step5_decision_record.md`. The probe's own outputs stand as generated.

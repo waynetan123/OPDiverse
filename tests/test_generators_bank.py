@@ -367,22 +367,110 @@ def test_line_numbering_guard(data):
 # --- External runner helpers (anthropic itself is not imported) ------------------
 
 
-def test_result_rows():
+class FakeAPIError(Exception):
+    status_code = 529
+    request_id = "req_err"
+
+
+def reply(text="{\"distractors\": []}", stop_reason="end_turn", category=None):
     usage = SimpleNamespace(input_tokens=10, output_tokens=5)
-    ok = SimpleNamespace(custom_id="c1", result=SimpleNamespace(type="succeeded", message=SimpleNamespace(
-        id="msg_1", model="claude-opus-5-5", stop_reason="end_turn", stop_details=None, usage=usage,
-        content=[SimpleNamespace(type="thinking", thinking=""), SimpleNamespace(type="text", text='{"distractors": []}')])))
-    refused = SimpleNamespace(custom_id="c2", result=SimpleNamespace(type="succeeded", message=SimpleNamespace(
-        id="msg_2", model="claude-opus-5-5", stop_reason="refusal", stop_details=SimpleNamespace(category="cyber"),
-        usage=usage, content=[])))
-    errored = SimpleNamespace(custom_id="c3", result=SimpleNamespace(type="errored", error=SimpleNamespace(type="api_error")))
-    rows = [external.result_row(x) for x in (ok, refused, errored)]
-    assert rows[0]["text"] == '{"distractors": []}' and rows[0]["usage"] == {"input_tokens": 10, "output_tokens": 5}
-    assert (rows[1]["stop_reason"], rows[1]["stop_category"], rows[1]["text"]) == ("refusal", "cyber", "")
-    assert rows[2]["error"] == {"type": "api_error"} and rows[2]["text"] is None
-    s = external.summarise(rows)
-    assert s["result_types"] == {"errored": 1, "succeeded": 2} and s["refusal_categories"] == {"cyber": 1}
+    return SimpleNamespace(id="msg_1", _request_id="req_1", model="claude-opus-5-5", stop_reason=stop_reason,
+                           stop_details=SimpleNamespace(category=category) if category else None, usage=usage,
+                           content=[SimpleNamespace(type="thinking", thinking=""), SimpleNamespace(type="text", text=text)])
+
+
+class FakeClient:
+    """messages.create(**params) -> a reply; `fail` names custom IDs (via the user text) that raise."""
+
+    def __init__(self, fail=(), refuse=()):
+        self.fail, self.refuse, self.sent = set(fail), set(refuse), []
+        self.messages = SimpleNamespace(create=self.create)
+
+    def create(self, **params):
+        user = params["messages"][0]["content"]
+        self.sent.append(user)
+        if user in self.fail:
+            raise FakeAPIError("overloaded")
+        if user in self.refuse:
+            return reply("", stop_reason="refusal", category="cyber")
+        return reply()
+
+
+def fake_requests(n):
+    return [{"custom_id": f"c{i}_a1", "params": external.message_params(f"u{i}")} for i in range(n)]
+
+
+def test_message_and_error_rows():
+    row = external.message_row("c1", reply(), "sha")
+    assert (row["result_type"], row["text"], row["request_id"], row["usage"]) == (
+        "succeeded", '{"distractors": []}', "req_1", {"input_tokens": 10, "output_tokens": 5})
+    refused = external.message_row("c2", reply("", "refusal", "cyber"), "sha")
+    assert (refused["result_type"], refused["stop_reason"], refused["stop_category"]) == ("succeeded", "refusal", "cyber")
+    err = external.error_row("c3", FakeAPIError("overloaded"), "sha")
+    assert err["result_type"] == "errored" and err["error"] == {"type": "FakeAPIError", "status": 529, "message": "overloaded"}
+    s = external.summarise([row, refused])
+    assert s["result_types"] == {"succeeded": 2} and s["refusal_categories"] == {"cyber": 1}
     assert s["usage_totals"] == {"input_tokens": 20, "output_tokens": 10} and s["models"] == ["claude-opus-5-5"]
+
+
+def test_run_resends_only_failures(tmp_path):
+    reqs = fake_requests(20)
+    partial = tmp_path / "mcq_generations.partial.jsonl"
+    client = FakeClient(fail={"u3", "u7"}, refuse={"u5"})
+    done, failed = external.run(client, reqs, partial, "sha", (FakeAPIError,), workers=4)
+    assert len(done) == 18 and sorted(r["custom_id"] for r in failed) == ["c3_a1", "c7_a1"]
+    assert done["c5_a1"]["stop_reason"] == "refusal"  # a refusal is the model's answer, kept as a result
+    assert len(partial.read_text().splitlines()) == 20  # every attempt is checkpointed as it arrives
+
+    retry = FakeClient()
+    done, failed = external.run(retry, reqs, partial, "sha", (FakeAPIError,), workers=4)
+    assert sorted(retry.sent) == ["u3", "u7"] and len(done) == 20 and not failed  # only the failures are re-sent
+
+    again = FakeClient()
+    external.run(again, reqs, partial, "sha", (FakeAPIError,))
+    assert again.sent == []  # nothing left to send
+
+
+def test_run_skips_a_torn_line_and_refuses_another_requests_file(tmp_path):
+    reqs = fake_requests(3)
+    partial = tmp_path / "p.jsonl"
+    external.run(FakeClient(), reqs[:2], partial, "sha", (FakeAPIError,))
+    with open(partial, "a") as f:
+        f.write('{"custom_id": "c2_a1", "result_')  # a crash mid-write
+    client = FakeClient()
+    done, _ = external.run(client, reqs, partial, "sha", (FakeAPIError,))
+    assert client.sent == ["u2"] and len(done) == 3
+    with pytest.raises(SystemExit, match="different requests file"):
+        external.run(FakeClient(), reqs, partial, "other-sha", (FakeAPIError,))
+
+
+def test_main_writes_results_only_when_complete(tmp_path, monkeypatch):
+    import types
+    reqs = fake_requests(5)
+    path = tmp_path / "mcq_requests.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in reqs))
+    clients = iter([FakeClient(fail={"u1"}), FakeClient()])
+    fake = types.ModuleType("anthropic")
+    fake.APIError, fake.__version__ = FakeAPIError, "test"
+    fake.Anthropic = lambda **kw: next(clients)
+    monkeypatch.setitem(sys.modules, "anthropic", fake)
+    monkeypatch.setattr(external, "require_clean_tree", lambda: {"commit": "abc", "dirty": False})
+    monkeypatch.setattr(external, "api_key", lambda: "sk-test")
+
+    with pytest.raises(SystemExit, match="1 requests failed"):
+        external.main(["--requests", str(path), "--workers", "2"])
+    out = tmp_path / "mcq_generations.jsonl"
+    assert not out.exists() and (tmp_path / "mcq_generations.partial.jsonl").exists()
+
+    assert external.main(["--requests", str(path)]) == 0
+    rows = [json.loads(line) for line in out.read_text().splitlines()]
+    assert [r["custom_id"] for r in rows] == sorted(r["custom_id"] for r in reqs)
+    assert all(r["result_type"] == "succeeded" for r in rows)
+    meta = json.loads((tmp_path / "mcq_run_meta.json").read_text())
+    assert meta["transport"] == "messages" and meta["transport_errors_resent"] == 1 and meta["n_requests"] == 5
+    assert not (tmp_path / "mcq_generations.partial.jsonl").exists()
+    with pytest.raises(SystemExit, match="already exists"):
+        external.main(["--requests", str(path)])
 
 
 def test_requires_clean_tree(monkeypatch):

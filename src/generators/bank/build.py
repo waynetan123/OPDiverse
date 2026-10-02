@@ -47,7 +47,7 @@ def _by_custom_id(path: Path) -> dict[str, dict]:
 
 def model_decisions(facts: list[dict], split: dict[str, dict], graph: CweGraph, files: BankFiles) -> list[dict]:
     if not files.mcq_generations.exists():
-        raise SystemExit(f"{files.mcq_generations} is missing: run the MCQ batch, or build with --dry-mcq")
+        raise SystemExit(f"{files.mcq_generations} is missing: run `python -m generators.external` on the MCQ requests, or build with --dry-mcq")
     first, retry = _by_custom_id(files.mcq_generations), _by_custom_id(files.mcq_retry_generations)
     counts = mcq.gold_counts(facts, {c: s["pool"] for c, s in split.items()})
     decisions, pending = [], []

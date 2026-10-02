@@ -87,9 +87,9 @@ The prompt is Qwen's chat rendering of the user message (`probe.prompts.render_q
 | Model | `claude-opus-5-5`. GPT o1 was considered and rejected: it returns no reasoning, OpenAI forbids extracting it, and the owner's permission for written-out reasoning covers Claude. | user |
 | Effort | `output_config.effort = "medium"`, set explicitly even though it is this model's default | user |
 | Thinking | Adaptive, which cannot be disabled on this model. The display is left at `omitted`, so thinking text is neither returned nor stored. | default |
-| Sampling | None. The model rejects `temperature`, `top_p`, `top_k` and a seed, and has no dated snapshot. **Outputs are cached and audited, not regenerated.** Every row records `model`, `message_id`, `stop_reason`, `usage` and the custom ID. `run_meta.json` records the batch ID, commit, SDK version and dates. | default |
-| Transport | Message Batches through `python -m generators.external`, with `custom_id = item_id` with `:` → `_`, plus `_a{attempt}`. Results are matched by `custom_id`, never by position. | default |
-| Refusals | No server-side fallbacks, which would silently switch models (Batches rejects them anyway). A `refusal` is logged with its `stop_details.category`, regenerated once, then filled by the rule. | default |
+| Sampling | None. The model rejects `temperature`, `top_p`, `top_k` and a seed, and has no dated snapshot. **Outputs are cached and audited, not regenerated.** Every row records `model`, `message_id`, `request_id`, `stop_reason`, `usage` and the custom ID. `run_meta.json` records the transport, concurrency, commit, SDK version and dates. | default |
+| Transport | **Messages API**, called concurrently by `python -m generators.external` (8 requests at a time by default, `--workers`; the SDK retries 429, 5xx and connection errors up to 8 times with backoff). Each result is checkpointed to `<prefix>_generations.partial.jsonl` as it arrives, and an interrupted run resumes without re-sending finished requests. A request that still fails in transport is re-sent by the next run, so it never uses up the item's one regeneration; a refusal is the model's answer and is kept. `custom_id = item_id` with `:` → `_`, plus `_a{attempt}`. Results are matched by `custom_id`, never by position. **Changed after the pilot** from Message Batches to direct calls (owner): the full batch took hours with no results. The request parameters and model are unchanged, so the pilot's results (made through Batches) stand. Cost: about twice the batch price, roughly $16 for the full run. | user |
+| Refusals | No server-side fallbacks, which would silently switch models. A `refusal` is logged with its `stop_details.category`, regenerated once, then filled by the rule. | default |
 | Request file | `data/bank/mcq_requests.jsonl`, 2,276 requests, sha256 `5627c5c3…b41ffd3`. Pilot: `data/bank/pilot/mcq_requests.jsonl`, 100 requests, sha256 `e834f104…96ab6225`. | — |
 
 ## Line-numbering check
@@ -137,19 +137,21 @@ Every 3rd line beats the keyword heuristic because, under ±1 tolerance, it land
 2. `PYTHONPATH=src python -m generators bank prepare-mcq --pilot` (already written; the rerun is byte-identical).
 3. On a machine with `pip install -r requirements-external.txt` and API credentials, at that commit:
    `PYTHONPATH=src python -m generators.external --requests data/bank/pilot/mcq_requests.jsonl`, then `python -m generators bank pilot-report`. Record the result below. The pilot's `usage_totals` give the cost estimate for the full run.
-4. `python -m generators.external --requests data/bank/mcq_requests.jsonl`, then `python -m generators bank prepare-mcq --retry`, then `python -m generators.external --requests data/bank/mcq_retry_requests.jsonl` (skip the last command if the retry file is empty).
+4. `python -m generators.external --requests data/bank/mcq_requests.jsonl`, then `python -m generators bank prepare-mcq --retry`, then `python -m generators.external --requests data/bank/mcq_retry_requests.jsonl` (skip the last command if the retry file is empty). If a run is interrupted, or ends reporting failed requests, rerun the same command: only requests without a result are sent.
 5. `python -m generators bank build`, then `check`, then `report`. Record the outcome below. The bank is now frozen.
 
 ## Outcome
 
-*To be filled in from `data/bank/pilot/pilot_report.md`, `data/bank/bank_report.md` and `bank_meta.json`.*
+From `data/bank/pilot/pilot_report.md`, `data/bank/bank_report.md` and `bank_meta.json`. The pins were committed before the first external request: the pilot ran at clean commit `8539539` (finished 2026-09-30 23:10 UTC), and the full run and regeneration at clean commit `3cacfc9` (2026-10-01 20:53–22:26 UTC). `bank check` found **0 violations**.
 
 | | |
 |---|---|
-| Pilot | |
-| MCQ: shortcut with model picks / guard | |
-| MCQ: distractor sources (model / regeneration / draw), refusals | |
-| Bank sha256s | |
+| Pilot | 100 / 100 `ok`, all with three admissible on the first attempt. Rejections: 7 ancestor, 7 descendant. No refusals. Shortcut 0.490. Decided nothing. |
+| MCQ: shortcut with model picks / guard | **0.440** (2,551 / 5,799) against the cut-off 0.5: **not fired, model picks kept.** The draw alone scores 0.348. |
+| MCQ: distractor sources (model / regeneration / draw), refusals | Non-test 5,790 / 9 / 0; test 1,023 / 3 / 3 (one test item has drawn distractors). Attempt 1: 2,276 `ok`; 5 items regenerated, all `ok`. Rejections: 179 descendant, 100 ancestor, 48 malformed, 4 duplicate, 3 not a live weakness, 1 gold. **No refusals.** |
+| Usage | Full run 1.38M input / 0.52M output tokens; regeneration 2.8k / 0.4k. Every reply `end_turn`, model `claude-opus-5-5`, no transport errors. |
+| Bank | Non-test 11,598 items (1,933 CVEs), test 2,058 (343). Gold letters: non-test A 479 / B 500 / C 449 / D 505; test A 85 / B 88 / C 91 / D 79. Baselines unchanged from the dry run except MCQ most-familiar-option 0.440. |
+| Bank sha256s | `bank_nontest.jsonl` `4d03cc38…0a327a4d`; `bank_test.jsonl` `6f6fbb5d…c7c3d4ad`; `mcq_decisions.jsonl` `4626e671…bf831dcb`; `bank_meta.json` `63fbea47…503d1131`. Inputs: `mcq_generations.jsonl` `09fda8e4…1be876a2`, `mcq_retry_generations.jsonl` `a7be7f35…15776655`, templates `c895958a…80681ca9`. |
 
 ## For later steps
 

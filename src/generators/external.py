@@ -1,14 +1,20 @@
-"""Run requests through the pinned external model (Message Batches). The only module that imports anthropic.
+"""Run requests through the pinned external model (Messages API). The only module that imports anthropic.
 
     pip install -r requirements-external.txt
     cp .env.example .env    # then put your key in .env (git-ignored)
-    PYTHONPATH=src python -m generators.external --requests data/bank/mcq_requests.jsonl
+    PYTHONPATH=src python -m generators.external --requests data/bank/mcq_requests.jsonl [--workers 8]
+
+Requests go out concurrently, and each result is appended to <prefix>_generations.partial.jsonl
+as it arrives. An interrupted or failed run loses nothing: rerun the same command and only the
+requests without a result are sent. When every request has one, the results are written, sorted, to
+<prefix>_generations.jsonl and the partial file is removed. A request that fails in transport (after
+the SDK's own retries) is re-sent by the next run rather than written as a result, so a network
+error never uses up an item's one regeneration; a refusal is the model's answer and is kept.
 
 The API key is read from ANTHROPIC_API_KEY in the .env file at the repository root, and only from there:
 a key exported in the shell is ignored, so a run always uses the key in .env.
 
-Writes <prefix>_generations.jsonl and <prefix>_run_meta.json next to the requests file. Refuses to run
-if the code state is dirty, if any request departs from pinned.EXTERNAL_MODEL, or if a custom_id repeats.
+Also writes <prefix>_run_meta.json next to the requests file. Refuses to run if the code state is dirty, if any request departs from pinned.EXTERNAL_MODEL, or if a custom_id repeats.
 The model has no dated snapshot and accepts no sampling parameters, so these files are the artifact:
 they are cached and audited, never expected to regenerate identically. Server-side fallbacks are not
 used, because they would switch models silently; a refusal is recorded and handled by the caller.
@@ -21,8 +27,8 @@ import hashlib
 import json
 import platform
 import re
-import time
 from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,13 +36,14 @@ from etl import pinned
 from etl.manifest import git_state
 from etl.paths import ROOT
 
-from .bank.files import generations_for, run_meta_for
-from .progress import Bar, track
+from .bank.files import generations_for, partial_for, run_meta_for
+from .progress import Bar
 
 CUSTOM_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 ENV_FILE = ROOT / ".env"
 API_KEY_VAR = "ANTHROPIC_API_KEY"
-POLL_SECONDS = 60
+WORKERS = 8
+MAX_RETRIES = 8  # the SDK retries 429, 5xx and connection errors, with backoff, this many times
 _SAMPLING = ("temperature", "top_p", "top_k", "seed")
 
 
@@ -61,10 +68,11 @@ def message_params(user: str, schema: dict | None = None) -> dict:
 
 
 def custom_id(item_id: str, attempt: int) -> str:
-    """Batch custom IDs allow [A-Za-z0-9_-] only: 'CVE-2021-1234:mcq:0', attempt 1 -> 'CVE-2021-1234_mcq_0_a1'."""
+    """The request's key in every output file: 'CVE-2021-1234:mcq:0', attempt 1 -> 'CVE-2021-1234_mcq_0_a1'.
+    The [A-Za-z0-9_-] form is kept from the batch transport so the pilot's files stay valid."""
     cid = f"{item_id.replace(':', '_')}_a{attempt}"
     if not CUSTOM_ID.fullmatch(cid):
-        raise ValueError(f"{cid!r} is not a valid batch custom_id")
+        raise ValueError(f"{cid!r} is not a valid custom_id")
     return cid
 
 
@@ -82,7 +90,7 @@ def check_request_pins(requests: list[dict]) -> None:
     for r in requests:
         p, cid = r["params"], r["custom_id"]
         if not CUSTOM_ID.fullmatch(cid):
-            raise SystemExit(f"{cid!r}: not a valid batch custom_id")
+            raise SystemExit(f"{cid!r}: not a valid custom_id")
         if (p.get("model"), p.get("max_tokens"), p.get("thinking")) != (m["model"], m["max_tokens"], m["thinking"]):
             raise SystemExit(f"{cid}: model / max_tokens / thinking differ from pinned.EXTERNAL_MODEL")
         if p.get("output_config", {}).get("effort") != m["effort"]:
@@ -141,26 +149,33 @@ def _plain(obj):
     return {k: _plain(v) for k, v in vars(obj).items()}
 
 
-def result_row(result) -> dict:
-    """One batch result -> one generations row. `text` joins the reply's text blocks; thinking
-    blocks carry no text under the pinned display ("omitted") and are not stored."""
-    r = result.result
-    row = {"custom_id": result.custom_id, "result_type": r.type, "model": None, "stop_reason": None,
-           "stop_category": None, "text": None, "usage": None, "error": None, "message_id": None}
-    if r.type == "succeeded":
-        msg = r.message
-        details = getattr(msg, "stop_details", None)
-        row.update({
+def _row(custom_id_: str, requests_sha: str) -> dict:
+    return {"custom_id": custom_id_, "requests_sha256": requests_sha, "result_type": None, "model": None,
+            "message_id": None, "request_id": None, "stop_reason": None, "stop_category": None, "text": None,
+            "usage": None, "error": None}
+
+
+def message_row(custom_id_: str, msg, requests_sha: str) -> dict:
+    """A reply -> one generations row. `text` joins the reply's text blocks; thinking blocks carry no
+    text under the pinned display ("omitted") and are not stored. A refusal is a result, not an error."""
+    details = getattr(msg, "stop_details", None)
+    return {**_row(custom_id_, requests_sha),
+            "result_type": "succeeded",
             "model": msg.model,
             "message_id": msg.id,
+            "request_id": getattr(msg, "_request_id", None),
             "stop_reason": msg.stop_reason,
             "stop_category": getattr(details, "category", None) if details is not None else None,
             "text": "".join(b.text for b in msg.content if b.type == "text"),
-            "usage": _plain(msg.usage),
-        })
-    elif r.type == "errored":
-        row["error"] = _plain(r.error)
-    return row
+            "usage": _plain(msg.usage)}
+
+
+def error_row(custom_id_: str, exc: Exception, requests_sha: str) -> dict:
+    """A request that failed after the SDK's retries. Never written to the final file: the next run re-sends it."""
+    return {**_row(custom_id_, requests_sha),
+            "result_type": "errored",
+            "request_id": getattr(exc, "request_id", None),
+            "error": {"type": type(exc).__name__, "status": getattr(exc, "status_code", None), "message": str(exc)[:500]}}
 
 
 def summarise(rows: list[dict]) -> dict:
@@ -179,89 +194,131 @@ def summarise(rows: list[dict]) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Batch run
+# Run
 # ---------------------------------------------------------------------------
 
 
-def finished(counts) -> int:
-    """Requests the batch is done with, whatever their outcome."""
-    return sum(getattr(counts, k, 0) or 0 for k in ("succeeded", "errored", "canceled", "expired"))
+def load_partial(path: Path, requests_sha: str) -> dict[str, dict]:
+    """custom_id -> its succeeded row from an earlier, interrupted run of the same requests file."""
+    done: dict[str, dict] = {}
+    if not path.exists():
+        return done
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue  # a line cut short by a crash is skipped; that request is simply re-sent
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if row.get("requests_sha256") != requests_sha:
+                raise SystemExit(f"{path} came from a different requests file; move it aside before running")
+            if row["result_type"] == "succeeded":
+                done[row["custom_id"]] = row
+    return done
 
 
-def progress_note(batch) -> str:
-    c = batch.request_counts
-    note = f"{batch.processing_status}: {c.succeeded:,} ok"
-    failed = (c.errored or 0) + (c.canceled or 0) + (c.expired or 0)
-    return note + (f", {failed:,} failed" if failed else "")
+def call(client, request: dict, requests_sha: str, errors: tuple[type[BaseException], ...]) -> dict:
+    try:
+        msg = client.messages.create(**request["params"])
+    except errors as exc:
+        return error_row(request["custom_id"], exc, requests_sha)
+    return message_row(request["custom_id"], msg, requests_sha)
 
 
-def wait_for_batch(client, batch_id: str, total: int, label: str = "batch", poll_seconds: int = POLL_SECONDS, sleep=time.sleep):
-    """Poll until the batch ends, with a progress bar. The API is asked once per poll_seconds; the
-    bar redraws every second in between so the clock keeps moving. Without a terminal, one status
-    line is printed per poll instead."""
-    with Bar(label, total) as bar:
-        while True:
-            batch = client.messages.batches.retrieve(batch_id)
-            bar.update(finished(batch.request_counts), note=progress_note(batch))
-            if not bar.enabled:
-                print(f"  {progress_note(batch)} ({finished(batch.request_counts):,}/{total:,} done)", flush=True)
-            if batch.processing_status == "ended":
-                return batch
-            for _ in range(poll_seconds):
-                sleep(1)
+def run(client, requests: list[dict], partial: Path, requests_sha: str, errors: tuple[type[BaseException], ...],
+        workers: int = WORKERS, label: str = "requests") -> tuple[dict[str, dict], list[dict]]:
+    """Send every request without a succeeded row in `partial`, appending each result as it arrives.
+    Returns (succeeded rows by custom_id, rows that failed this run). Ctrl-C stops sending new
+    requests and waits for the ones in flight, so nothing already paid for is lost; a second Ctrl-C
+    abandons them."""
+    done = load_partial(partial, requests_sha)
+    todo = [r for r in requests if r["custom_id"] not in done]
+    failed: list[dict] = []
+    partial.parent.mkdir(parents=True, exist_ok=True)
+    with open(partial, "a", encoding="utf-8") as out, Bar(label, len(requests)) as bar:
+        def record(row: dict) -> None:
+            out.write(json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n")
+            out.flush()
+            if row["result_type"] == "succeeded":
+                done[row["custom_id"]] = row
+            else:
+                failed.append(row)
+            bar.update(len(done), note=f"{len(failed):,} failed, will be re-sent" if failed else "")
+
+        bar.update(len(done), note=f"resuming: {len(done):,} already done" if done else "")
+        pool = ThreadPoolExecutor(max_workers=workers)
+        pending = {pool.submit(call, client, r, requests_sha, errors) for r in todo}
+        try:
+            while pending:
+                finished, pending = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+                for future in finished:
+                    record(future.result())
                 bar.refresh()
+        except KeyboardInterrupt:
+            queued = sum(f.cancel() for f in pending)
+            in_flight = [f for f in pending if not f.cancelled()]
+            print(f"\ninterrupted: {queued:,} requests not sent; waiting for {len(in_flight):,} in flight "
+                  "(Ctrl-C again to abandon them)", flush=True)
+            try:
+                for future in in_flight:
+                    record(future.result())
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
+            raise SystemExit(f"stopped with {len(done):,}/{len(requests):,} done; rerun the same command to continue")
+        pool.shutdown()
+    return done, failed
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m generators.external", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--requests", type=Path, required=True)
-    ap.add_argument("--resume", metavar="BATCH_ID", help="collect an already-submitted batch instead of creating one")
+    ap.add_argument("--workers", type=int, default=WORKERS, help=f"concurrent requests (default {WORKERS})")
     args = ap.parse_args(argv)
 
     import anthropic
 
+    out = generations_for(args.requests)
+    if out.exists():
+        raise SystemExit(f"{out} already exists: this requests file is complete")
     git = require_clean_tree()
     key = api_key()
     requests = load_requests(args.requests)
     check_request_pins(requests)
     requests_sha = hashlib.sha256(args.requests.read_bytes()).hexdigest()
-    client = anthropic.Anthropic(api_key=key)
-    started = datetime.now(timezone.utc)
-    if args.resume:
-        batch_id = args.resume
-    else:
-        print(f"submitting {len(requests)} requests ...")
-        batch = client.messages.batches.create(
-            requests=[{"custom_id": r["custom_id"], "params": r["params"]} for r in requests])
-        batch_id = batch.id
-        # Written before polling so an interrupted run can be resumed with --resume.
-        args.requests.with_name(args.requests.stem + ".batch_id").write_text(batch_id + "\n", encoding="utf-8")
-    print(f"batch {batch_id}: {len(requests)} requests")
+    client = anthropic.Anthropic(api_key=key, max_retries=MAX_RETRIES)
+    partial = partial_for(args.requests)
     job = args.requests.stem.removesuffix("_requests")  # mcq, mcq_retry, ...
-    batch = wait_for_batch(client, batch_id, len(requests), label=f"{job} batch")
-    results = track(client.messages.batches.results(batch_id), f"{job} results", total=len(requests))
-    rows = sorted((result_row(r) for r in results), key=lambda r: r["custom_id"])
-    wanted = {r["custom_id"] for r in requests}
-    got = {r["custom_id"] for r in rows}
-    if got != wanted:
-        raise SystemExit(f"results don't match requests: {len(wanted - got)} missing, {len(got - wanted)} unexpected")
-    out = generations_for(args.requests)
+    started = datetime.now(timezone.utc)
+    print(f"{job}: {len(requests):,} requests, {args.workers} at a time")
+    done, failed = run(client, requests, partial, requests_sha, (anthropic.APIError,), args.workers, label=job)
+    if failed:
+        kinds = Counter(f"{r['error']['type']} {r['error']['status'] or ''}".strip() for r in failed)
+        raise SystemExit(f"{len(failed):,} requests failed ({dict(kinds)}); {len(done):,} succeeded and are kept "
+                         f"in {partial.name}. Rerun the same command to send only the failed ones.")
+
+    rows = [done[r["custom_id"]] for r in sorted(requests, key=lambda r: r["custom_id"])]
     out.write_text("".join(json.dumps(r, sort_keys=True, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
+    with open(partial, encoding="utf-8") as f:
+        attempts = Counter(json.loads(line)["result_type"] for line in f if line.strip().startswith("{"))
     meta = {
-        "started_utc": started.isoformat(timespec="seconds"),
         "finished_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "batch_id": batch_id,
+        "last_session_started_utc": started.isoformat(timespec="seconds"),
+        "transport": "messages",
+        "workers": args.workers,
+        "max_retries": MAX_RETRIES,
         "requests_sha256": requests_sha,
         "n_requests": len(requests),
+        "transport_errors_resent": attempts.get("errored", 0),
         "git": git,
         "external_model": pinned.EXTERNAL_MODEL,
         "versions": {"anthropic": anthropic.__version__, "python": platform.python_version()},
-        "request_counts": _plain(batch.request_counts),
         **summarise(rows),
     }
     run_meta_for(args.requests).write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print(f"wrote {len(rows)} results to {out}: {meta['result_types']}, stop reasons {meta['stop_reasons']}")
+    partial.unlink()
+    print(f"wrote {len(rows):,} results to {out}: stop reasons {meta['stop_reasons']}")
     return 0
 
 

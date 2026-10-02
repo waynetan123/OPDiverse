@@ -1,7 +1,7 @@
-"""Pinned definitions for the OPDiverse fact table, test window, hierarchy scoring, probe and question bank.
+"""Pinned definitions for the OPDiverse fact table, test window, hierarchy scoring, probe, question bank and frozen-model session.
 
 Everything here can move a census count, a split or a score. It is frozen before step 0: any
-change needs a matching entry in docs/decisions/step{1,2,3,4}_decision_record.md. Pure functions,
+change needs a matching entry in docs/decisions/step{1,...,5}_decision_record.md. Pure functions,
 stdlib only, no I/O.
 """
 
@@ -95,8 +95,8 @@ EVAL_STOP_TOKENS = ("<|im_end|>", "<|endoftext|>")
 EVAL_MAX_MODEL_LEN = 16_985
 # The Qwen2.5 chat template inserts this when no system message is given.
 QWEN_SYSTEM_PROMPT = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
-# Filled in from run_meta.json after the first vLLM run; every later evaluation must match it.
-VLLM_VERSION: str | None = None
+# From the probe's run_meta.json (step 3); pinned at step 5. Every later vLLM run must match it.
+VLLM_VERSION: str | None = "0.30.0"
 
 # ---------------------------------------------------------------------------
 # Contamination probe (step 3)
@@ -213,6 +213,57 @@ EXTERNAL_MODEL = {
     "max_tokens": 16_000,
     "thinking": {"type": "adaptive"},
 }
+
+# ---------------------------------------------------------------------------
+# Frozen-model session (step 5): the GRPO signal audit and distill-self rationales
+# ---------------------------------------------------------------------------
+
+# One sampling config for the audit and for GRPO training rollouts: TRL GRPOConfig's defaults.
+# n, max_tokens and a per-request seed are added per request (frozen_model.requests.sampling_for).
+ROLLOUT_SAMPLING = {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "repetition_penalty": 1.0,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+}
+ROLLOUT_N = 8
+# The plan's per-type rollout caps. The GRPO cap per type is the smallest of these and
+# ROLLOUT_CAP_CANDIDATES at which at most ROLLOUT_CUTOFF_MAX of audit rollouts are cut off.
+ROLLOUT_MAX_TOKENS = {"mcq": 16, "exact_id": 24, "cvss": 48, "find_error": 64, "line_loc": 64}
+ROLLOUT_CAP_CANDIDATES = (128, 256, 512)
+ROLLOUT_CUTOFF_MAX = Fraction(1, 10)
+
+# The audit samples once at AUDIT_MAX_TOKENS; a shorter cap's rollout is a prefix of that sample.
+AUDIT_PER_TYPE = 200   # find_error: both items of AUDIT_PER_TYPE // 2 CVEs
+AUDIT_MAX_TOKENS = 512
+AUDIT_LIVE = Fraction(1, 2)    # live-group fraction >= this: the column trains as specified
+AUDIT_FLOOR = Fraction(1, 10)  # below this: floored; in between: dynamic sampling (GRPO)
+AUDIT_SALT = "signal-audit"
+
+# distill-self: attempt 1 is greedy (EVAL_SAMPLING); the one regeneration samples under ROLLOUT_SAMPLING.
+RATIONALE_MAX_TOKENS = EVAL_MAX_TOKENS
+RATIONALE_SALT = "distill-self"
+RATIONALE_PROMPT = (
+    "{user}\n\n"
+    "The correct answer is:\n{target}\n\n"
+    "Write out, step by step, the reasoning that leads from the information above to this answer, as if you "
+    "were working it out yourself. Do not say or suggest that you were given the answer. Finish with the "
+    "answer alone on the last line, written exactly as: {target}"
+)
+# A rationale whose reasoning matches any of these restates the hint rather than justifying the answer.
+HINT_LEAK = tuple(re.compile(p, re.IGNORECASE) for p in (
+    r"\b(?:we|i)\s+(?:were|was|are|am|have\s+been|'ve\s+been)\s+(?:told|given|informed)\b",
+    r"\b(?:given|provided|supplied|stated)\s+(?:correct\s+)?(?:answer|solution)\b",
+    r"\b(?:answer|solution)\s+(?:was|is|has\s+been)\s+(?:given|provided|supplied|stated)\b",
+    r"\bthe\s+hint\b",
+    r"\b(?:you|the\s+(?:prompt|question|user))\s+(?:said|says|stated|states|told|tells)\b[^.\n]{0,40}\banswer\b",
+))
+# Substitution, per type, on the FIRST-attempt surface-validity pass rate (owner, step 5): fires if the
+# pass rate is below SUBSTITUTION_MAX or the fallback-to-gold-only rate exceeds it. If it fires on
+# SUBSTITUTION_DROP_AT or more types, distill-self leaves the primary test.
+SUBSTITUTION_MAX = Fraction(1, 2)
+SUBSTITUTION_DROP_AT = 3
 
 # Deprecated CWE-1000 weaknesses -> replacement, read from each entry's Description in the
 # 4.20 XML. A replacement is recorded only where MITRE names exactly one successor; None

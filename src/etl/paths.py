@@ -140,5 +140,10 @@ class Paths:
         """--dry-mcq output: MCQ options from the prior-matched draw only, never frozen."""
         return self.bank / "dry"
 
+    # Step 5: frozen-model session (file names are in frozen_model.files)
+    @property
+    def frozen_model(self) -> Path:
+        return self.data / "frozen_model"
+
 
 DEFAULT = Paths(ROOT / "data")

@@ -22,6 +22,13 @@ class TokenCounter:
     def count(self, texts: list[str]) -> list[int]:
         return [len(e.ids) for e in self._tokenizer.encode_batch(texts, add_special_tokens=False)]
 
+    def decode(self, ids: list[int]) -> str:
+        """Token ids -> text, special tokens dropped (as vLLM's skip_special_tokens)."""
+        return self._tokenizer.decode(ids, skip_special_tokens=True)
+
+    def token_id(self, token: str) -> int | None:
+        return self._tokenizer.token_to_id(token)
+
 
 def pinned_counter(path: Path) -> TokenCounter:
     if pinned.TOKENIZER_REVISION is None or pinned.TOKENIZER_SHA256 is None:

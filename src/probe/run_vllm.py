@@ -56,16 +56,17 @@ def check_rendering(requests: list[dict], apply_chat_template) -> None:
                              f"{rendered!r}\n!=\n{r['prompt']!r}")
 
 
-def llm_kwargs(engine_arg_names: set[str]) -> tuple[dict, list[str]]:
+def llm_kwargs(engine_arg_names: set[str], max_model_len: int = pinned.EVAL_MAX_MODEL_LEN) -> tuple[dict, list[str]]:
     """Engine arguments; `generation_config="vllm"` stops vLLM applying Qwen's sampling defaults.
-    Versions without that argument never applied model defaults, so explicit sampling suffices there."""
+    Versions without that argument never applied model defaults, so explicit sampling suffices there.
+    max_model_len only sets capacity; it never changes the output of a sequence that fits."""
     kwargs = {
         "model": pinned.TOKENIZER_REPO,
         "revision": pinned.TOKENIZER_REVISION,
         "tokenizer_revision": pinned.TOKENIZER_REVISION,
         "dtype": pinned.EVAL_DTYPE,
         "seed": pinned.EVAL_SAMPLING["seed"],
-        "max_model_len": pinned.EVAL_MAX_MODEL_LEN,
+        "max_model_len": max_model_len,
     }
     notes = []
     if "generation_config" in engine_arg_names:
@@ -97,6 +98,22 @@ def generation_rows(requests: list[dict], outputs) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
+def pinned_tokenizer():
+    """(HF tokenizer at the pinned revision, its tokenizer.json sha256, stop token ids). Exits on any mismatch."""
+    from huggingface_hub import hf_hub_download
+    from transformers import AutoTokenizer
+
+    tok_path = hf_hub_download(pinned.TOKENIZER_REPO, "tokenizer.json", revision=pinned.TOKENIZER_REVISION)
+    tok_sha = hashlib.sha256(Path(tok_path).read_bytes()).hexdigest()
+    if tok_sha != pinned.TOKENIZER_SHA256:
+        raise SystemExit(f"tokenizer.json sha256 {tok_sha} != pinned {pinned.TOKENIZER_SHA256}")
+    tokenizer = AutoTokenizer.from_pretrained(pinned.TOKENIZER_REPO, revision=pinned.TOKENIZER_REVISION)
+    stop_ids = [tokenizer.convert_tokens_to_ids(t) for t in pinned.EVAL_STOP_TOKENS]
+    if any(i is None or i == tokenizer.unk_token_id for i in stop_ids):
+        raise SystemExit(f"stop tokens {pinned.EVAL_STOP_TOKENS} not all in the vocabulary: {stop_ids}")
+    return tokenizer, tok_sha, stop_ids
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m probe.run_vllm", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -109,20 +126,11 @@ def main(argv: list[str] | None = None) -> int:
     import torch
     import transformers
     import vllm
-    from huggingface_hub import hf_hub_download
-    from transformers import AutoTokenizer
 
     requests = load_requests(args.requests)
     check_request_pins(requests)
-    tok_path = hf_hub_download(pinned.TOKENIZER_REPO, "tokenizer.json", revision=pinned.TOKENIZER_REVISION)
-    tok_sha = hashlib.sha256(Path(tok_path).read_bytes()).hexdigest()
-    if tok_sha != pinned.TOKENIZER_SHA256:
-        raise SystemExit(f"tokenizer.json sha256 {tok_sha} != pinned {pinned.TOKENIZER_SHA256}")
-    tokenizer = AutoTokenizer.from_pretrained(pinned.TOKENIZER_REPO, revision=pinned.TOKENIZER_REVISION)
+    tokenizer, tok_sha, stop_ids = pinned_tokenizer()
     check_rendering(requests, lambda m: tokenizer.apply_chat_template(m, tokenize=False, add_generation_prompt=True))
-    stop_ids = [tokenizer.convert_tokens_to_ids(t) for t in pinned.EVAL_STOP_TOKENS]
-    if any(i is None or i == tokenizer.unk_token_id for i in stop_ids):
-        raise SystemExit(f"stop tokens {pinned.EVAL_STOP_TOKENS} not all in the vocabulary: {stop_ids}")
     print(f"checks passed: {len(requests)} requests, tokenizer sha256 ok, chat template ok, stop ids {stop_ids}")
     if args.check_only:
         return 0

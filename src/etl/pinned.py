@@ -267,24 +267,13 @@ SUBSTITUTION_MAX = Fraction(1, 2)
 SUBSTITUTION_DROP_AT = 3
 
 # ---------------------------------------------------------------------------
-# External-model jobs (step 6): distill-external traces and DPO rejected answers
+# External-model jobs (step 6): DPO rejected answers
 # ---------------------------------------------------------------------------
 
-TEACHER_JOBS = ("trace", "dpo")
+# distill-external is not run (owner, step 6): the external model refused all 120 pilot trace requests
+# under its `reasoning_extraction` category. See docs/decisions/step6_decision_record.md.
 TEACHER_PILOT_CVES = 20
 TEACHER_SALTS = {"pilot": "teacher-pilot", "dpo": "dpo-rule"}
-
-# distill-external: the item's own question, unhinted, with the reasoning written out in the reply. The
-# training prompt stays the item's `prompt`. The target (reasoning, a blank line, the canonical answer)
-# must fit the evaluation budget with its stop token (owner, step 6): at most TRACE_MAX_TOKENS - 1
-# tokens under the backbone tokenizer. Wrong answers are kept: no verifier selects distill data.
-TRACE_WORDS = 250
-TRACE_MAX_TOKENS = EVAL_MAX_TOKENS
-TRACE_PROMPT = (
-    "{user}\n\n"
-    "Before you answer, write out your reasoning step by step in plain prose, in at most {words} words. "
-    "Then give the answer alone on the last line, exactly in the form the question asks for."
-)
 
 # DPO: chosen is the gold target; rejected is a near miss one unit of error from gold, in the same
 # canonical format. The external model picks which near miss, the rules in generators.teacher.dpo decide

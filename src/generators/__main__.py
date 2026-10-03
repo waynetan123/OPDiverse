@@ -13,13 +13,13 @@ Step 4, the question bank:
 --dry-mcq on build / check / report works in data/bank/dry with every MCQ from the prior-matched draw:
 no external request, never frozen.
 
-Step 6, the external-model jobs over the frozen non-test bank (data/teacher):
+Step 6, the DPO rejected answers over the frozen non-test bank (data/teacher):
 
-    PYTHONPATH=src python -m generators teacher prepare --pilot  # -> data/teacher/pilot/{trace,dpo}_requests.jsonl
+    PYTHONPATH=src python -m generators teacher prepare --pilot  # -> data/teacher/pilot/dpo_requests.jsonl
     PYTHONPATH=src python -m generators teacher pilot-report     # pilot generations -> pilot_report.{json,md}
-    PYTHONPATH=src python -m generators teacher prepare          # -> trace_requests.jsonl, dpo_requests.jsonl
-    PYTHONPATH=src python -m generators teacher prepare-retry    # invalid first attempts -> *_retry_requests.jsonl
-    PYTHONPATH=src python -m generators teacher build            # -> distill_external.jsonl, dpo.jsonl, step6_report.{json,md}
+    PYTHONPATH=src python -m generators teacher prepare          # -> dpo_requests.jsonl
+    PYTHONPATH=src python -m generators teacher prepare-retry    # invalid first proposals -> dpo_retry_requests.jsonl
+    PYTHONPATH=src python -m generators teacher build            # -> dpo.jsonl, step6_report.{json,md}
 """
 
 from __future__ import annotations
@@ -63,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
         return TokenCounter(tok_path, None) if args.unpinned_tokenizer else pinned_counter(tok_path)
 
     if args.group == "teacher":
-        return teacher(args, paths, tokens)
+        return teacher(args, paths)
     if args.command == "prepare-mcq":
         files, rows = prepare.prepare_mcq(paths, pilot=args.pilot, retry=args.retry)
         print(f"wrote {len(rows)} MCQ requests to {files.mcq_retry_requests if args.retry else files.mcq_requests}")
@@ -85,20 +85,19 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def teacher(args, paths: Paths, tokens) -> int:
+def teacher(args, paths: Paths) -> int:
     if args.command == "prepare":
-        counts = teacher_prepare.prepare(paths, pilot=args.pilot)
-        print(f"wrote {counts['trace']:,} trace and {counts['dpo']:,} DPO requests" + (" (pilot)" if args.pilot else ""))
+        n = teacher_prepare.prepare(paths, pilot=args.pilot)
+        print(f"wrote {n:,} DPO requests" + (" (pilot)" if args.pilot else ""))
     elif args.command == "pilot-report":
-        out = teacher_report.pilot_report(paths, tokens())
-        print(f"pilot: full run estimated at ${out['cost_usd']['full_run_estimate_total']:,.2f}; see pilot_report.md")
+        out = teacher_report.pilot_report(paths)
+        print(f"pilot: full run estimated at ${out['cost_usd']['full_run_estimate']:,.2f}; see pilot_report.md")
     elif args.command == "prepare-retry":
-        counts = teacher_prepare.prepare_retry(paths, tokens())
-        print(f"regenerations: {counts['trace']:,} trace, {counts['dpo']:,} DPO (a job with none writes no retry file)")
+        n = teacher_prepare.prepare_retry(paths)
+        print(f"{n:,} DPO regenerations" + ("" if n else "; no retry file written, go straight to build"))
     else:
-        out = teacher_report.write(paths, teacher_build.build(paths, tokens()))
-        print(f"built distill_external.jsonl and dpo.jsonl for {out['n_items']:,} items; "
-              f"total cost ${out['total_cost_usd']:,.2f}; see step6_report.md")
+        out = teacher_report.write(paths, teacher_build.build(paths))
+        print(f"built dpo.jsonl for {out['n_items']:,} items; total cost ${out['total_cost_usd']:,.2f}; see step6_report.md")
     return 0
 
 

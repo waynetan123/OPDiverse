@@ -1,4 +1,4 @@
-"""File names for the external-model jobs: data/teacher, or data/teacher/pilot.
+"""File names for the external-model job (DPO rejected answers): data/teacher, or data/teacher/pilot.
 
 Each request file gets the runner's outputs next to it (generators.bank.files): <prefix>_generations.jsonl,
 <prefix>_generations.partial.jsonl while running, and <prefix>_run_meta.json.
@@ -20,15 +20,11 @@ class TeacherFiles:
     def of(cls, paths: Paths, pilot: bool = False) -> TeacherFiles:
         return cls(paths.teacher_pilot if pilot else paths.teacher)
 
-    def requests(self, job: str, retry: bool = False) -> Path:
-        """job is 'trace' or 'dpo'; retry is the one regeneration."""
-        return self.dir / f"{job}{'_retry' if retry else ''}_requests.jsonl"
+    def requests(self, retry: bool = False) -> Path:
+        """The first attempt, or (retry) the one regeneration."""
+        return self.dir / f"dpo{'_retry' if retry else ''}_requests.jsonl"
 
-    # Outputs, one row per non-test item, keyed by item_id
-    @property
-    def distill_external(self) -> Path:
-        return self.dir / "distill_external.jsonl"
-
+    # Output, one row per non-test item, keyed by item_id
     @property
     def dpo(self) -> Path:
         return self.dir / "dpo.jsonl"

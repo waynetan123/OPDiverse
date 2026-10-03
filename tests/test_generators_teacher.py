@@ -1,5 +1,5 @@
-"""Step 6 on a small fixture: request files, trace validity, the DPO near-miss rules and their rule-built
-fallback, the MCQ rule, the one regeneration, the pilot report, and the whole CLI path with fake generations."""
+"""Step 6 on a small fixture: request files, the DPO near-miss rules and their rule-built fallback, the MCQ
+rule, the one regeneration, the pilot report, and the whole CLI path with fake generations."""
 
 import hashlib
 import json
@@ -20,9 +20,9 @@ from generators.bank.build import load_inputs
 from generators.bank.check import code_lines
 from generators.bank.files import BankFiles, generations_for, run_meta_for
 from generators.bank.report import distance
-from generators.teacher import dpo, prepare, traces
+from generators.teacher import dpo, prepare
 from generators.teacher.files import TeacherFiles
-from test_frozen_model import FE, LINES, MCQ, data  # noqa: F401  (data is a fixture)
+from test_frozen_model import FE, LINES, data  # noqa: F401  (data is a fixture)
 
 ROOT = Path(__file__).resolve().parents[1]
 VEC = "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
@@ -34,12 +34,7 @@ def graph():
 
 
 def run(paths, *args):
-    return cli.main(["teacher", *args, "--data-dir", str(paths.data), "--tokenizer", str(paths.data / "tokenizer.json"),
-                     "--unpinned-tokenizer"])
-
-
-def words(text):
-    return len(text.split())
+    return cli.main(["teacher", *args, "--data-dir", str(paths.data)])
 
 
 def gen(text="", stop="end_turn", category=None):
@@ -74,16 +69,11 @@ def test_prepare_on_fixture(data):
     assert run(data, "prepare") == 0
     files = TeacherFiles.of(data)
     bank = bank_of(data)
-    trace, dpo_rows = read_jsonl(files.requests("trace")), read_jsonl(files.requests("dpo"))
-    assert len(trace) == len(bank) == 8 * pinned.ITEMS_PER_CVE
+    dpo_rows = read_jsonl(files.requests())
+    assert len(bank) == 8 * pinned.ITEMS_PER_CVE
     assert len(dpo_rows) == len(bank) - 8 and "mcq" not in {r["type"] for r in dpo_rows}
-    external.check_request_pins(trace + dpo_rows)
-    assert all(r["custom_id"].startswith("trace_") for r in trace) and all(r["custom_id"].startswith("dpo_") for r in dpo_rows)
-    for r in trace:
-        user = r["params"]["messages"][0]["content"]
-        item = bank[r["item_id"]]
-        assert user.startswith(item["user"]) and f"at most {pinned.TRACE_WORDS} words" in user
-        assert item["target"] not in user.removeprefix(item["user"]) and "format" not in r["params"]["output_config"]
+    external.check_request_pins(dpo_rows)
+    assert all(r["custom_id"].startswith("dpo_") and r["custom_id"].endswith("_a1") for r in dpo_rows)
     for r in dpo_rows:
         item, params = bank[r["item_id"]], r["params"]
         user = params["messages"][0]["content"]
@@ -91,17 +81,17 @@ def test_prepare_on_fixture(data):
         assert params["output_config"]["format"]["schema"] == pinned.DPO_SCHEMAS[pinned.DPO_FIELDS[item["type"]]]
     ex = next(r for r in dpo_rows if r["type"] == "exact_id" and bank[r["item_id"]]["gold"]["cwe"] == "CWE-787")
     assert "- CWE-119: " in ex["params"]["messages"][0]["content"]  # 787's parent is listed by name
-    first = files.requests("trace").read_bytes()
-    assert run(data, "prepare") == 0 and files.requests("trace").read_bytes() == first
+    first = files.requests().read_bytes()
+    assert run(data, "prepare") == 0 and files.requests().read_bytes() == first
 
 
 def test_pilot_sample(data, monkeypatch):
     monkeypatch.setattr(pinned, "TEACHER_PILOT_CVES", 3)
     assert run(data, "prepare", "--pilot") == 0
     files = TeacherFiles.of(data, pilot=True)
-    trace = read_jsonl(files.requests("trace"))
-    assert len(trace) == 18 and len({r["cve_id"] for r in trace}) == 3 and len(read_jsonl(files.requests("dpo"))) == 15
-    assert not TeacherFiles.of(data).requests("trace").exists()
+    rows = read_jsonl(files.requests())
+    assert len(rows) == 15 and len({r["cve_id"] for r in rows}) == 3
+    assert not TeacherFiles.of(data).requests().exists()
 
 
 def test_prepare_is_byte_identical_across_hash_seeds(data):
@@ -111,7 +101,7 @@ def test_prepare_is_byte_identical_across_hash_seeds(data):
                        check=True, capture_output=True,
                        env={**os.environ, "PYTHONPATH": str(ROOT / "src"), "PYTHONHASHSEED": seed})
         files = TeacherFiles.of(data)
-        digests.append([hashlib.sha256(files.requests(j).read_bytes()).hexdigest() for j in pinned.TEACHER_JOBS])
+        digests.append(hashlib.sha256(files.requests().read_bytes()).hexdigest())
     assert digests[0] == digests[1]
 
 
@@ -120,57 +110,9 @@ def test_teacher_rejects_bank_commands(data):
         run(data, "check")
 
 
-# --- Traces --------------------------------------------------------------------
+# --- DPO rules -------------------------------------------------------------------
 
 CVSS = {"item_id": "CVE-1:cvss:0", "cve_id": "CVE-1", "type": "cvss", "index": 0, "target": VEC, "gold": {"vector": VEC}}
-
-
-@pytest.mark.parametrize("item, row, expected", [
-    (MCQ, gen("The bound is never checked, so B.\n\n**ANSWER: B**\n"), ("The bound is never checked, so B.\n\nANSWER: B", True)),
-    (MCQ, gen("C fits better.\nANSWER: C"), ("C fits better.\n\nANSWER: C", False)),       # a wrong answer is kept
-    (MCQ, gen("", "refusal", "reasoning_extraction"), "refusal"),
-    (MCQ, gen("B fits", "max_tokens"), "max_tokens"),
-    (MCQ, gen(""), "empty"),
-    (MCQ, gen("Thinking.\nNo idea."), "no_final_answer"),
-    (MCQ, gen("ANSWER: B"), "no_reasoning"),
-    (MCQ, gen("word " * 600 + "\nANSWER: B"), "too_long"),
-    (CVSS, gen("Remote, no auth.\nAV:N/AC:L"), "incomplete_answer"),
-    (CVSS, gen("Remote, no auth.\nCVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:L"),
-     ("Remote, no auth.\n\nAV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:L", False)),
-    (FE, gen("memcpy overflows t.\nVULNERABLE: yes"), "incomplete_answer"),
-    (FE, gen("memcpy overflows t.\nVULNERABLE: yes, cwe 0787"), ("memcpy overflows t.\n\nVULNERABLE: yes, CWE-787", True)),
-    (LINES, gen("The check is at 12.\nLINES: 12, 99"), ("The check is at 12.\n\nLINES: 12", False)),
-])
-def test_trace_validate(graph, item, row, expected):
-    valid, reason = traces.validate(item, row, words, graph)
-    if isinstance(expected, str):
-        assert valid is None and reason == expected
-    else:
-        assert reason is None and (valid["target"], valid["correct"]) == expected
-        assert valid["target_tokens"] == words(valid["target"])
-
-
-def test_trace_length_boundary(graph):
-    fits = gen("w " * (pinned.TRACE_MAX_TOKENS - 3) + "\nANSWER: B")   # 509 words + 2 answer tokens = 511
-    assert traces.validate(MCQ, fits, words, graph)[1] is None
-    over = gen("w " * (pinned.TRACE_MAX_TOKENS - 2) + "\nANSWER: B")
-    assert traces.validate(MCQ, over, words, graph)[1] == "too_long"
-
-
-def test_trace_decide(graph):
-    bad = gen("", "refusal", "reasoning_extraction")
-    with pytest.raises(SystemExit, match="no regeneration"):
-        traces.decide(MCQ, bad, None, words, graph)
-    row = traces.decide(MCQ, bad, gen("B fits.\nANSWER: B"), words, graph)
-    assert (row["source"], row["a1_reason"], row["a1_stop_category"]) == ("ext_a2", "refusal", "reasoning_extraction")
-    row = traces.decide(MCQ, bad, bad, words, graph)
-    assert row["source"] == "gold_only" and row["target"] == "ANSWER: B" and row["correct"] is None
-    s = traces.summarise([row, traces.decide(MCQ, gen("C.\nANSWER: C"), None, words, graph)])
-    assert s["types"]["mcq"]["refusal_categories"] == {"reasoning_extraction": 2}
-    assert s["types"]["mcq"]["correct_rate"] == "0" and s["types"]["mcq"]["band"] == "floored"
-
-
-# --- DPO rules -------------------------------------------------------------------
 
 EXACT = {"item_id": "CVE-1:exact_id:0", "cve_id": "CVE-1", "type": "exact_id", "index": 0, "target": "CWE-787",
          "gold": {"cwe": "CWE-787"}}
@@ -294,14 +236,6 @@ def test_end_to_end(data):
     files = TeacherFiles.of(data)
     bank = bank_of(data)
 
-    def trace_a1(r):
-        item = bank[r["item_id"]]
-        if item["type"] == "line_loc":
-            return "word " * 600 + "\n" + item["target"], "end_turn"            # too long
-        if item["type"] == "cvss":
-            return "", "refusal", "reasoning_extraction"
-        return f"Reasoning about {item['type']}.\n{item['target']}", "end_turn"
-
     def dpo_a1(r):
         item = bank[r["item_id"]]
         if item["type"] == "cvss":
@@ -312,33 +246,22 @@ def test_end_to_end(data):
             return json.dumps({"cwe": item["gold"]["cwe"]}), "end_turn"
         return json.dumps({"cwe": dpo.neighbours(item["gold"]["cwe"], GRAPH)[0]}), "end_turn"
 
-    write_generations(files.requests("trace"), trace_a1, meta=True)
-    write_generations(files.requests("dpo"), dpo_a1, meta=True)
+    write_generations(files.requests(), dpo_a1, meta=True)
     with pytest.raises(SystemExit, match="no regeneration"):
         run(data, "build")
     assert run(data, "prepare-retry") == 0
-    trace_retry, dpo_retry = read_jsonl(files.requests("trace", True)), read_jsonl(files.requests("dpo", True))
-    assert {r["type"] for r in trace_retry} == {"line_loc", "cvss"} and len(trace_retry) == 16
-    assert {r["type"] for r in dpo_retry} == {"line_loc", "cvss"} and all(r["attempt"] == 2 for r in dpo_retry)
-    first = {r["item_id"]: r for r in read_jsonl(files.requests("trace"))}
-    assert all(r["params"] == first[r["item_id"]]["params"] for r in trace_retry)   # the same request, sent again
+    retry = read_jsonl(files.requests(retry=True))
+    assert {r["type"] for r in retry} == {"line_loc", "cvss"} and len(retry) == 16 and all(r["attempt"] == 2 for r in retry)
+    first = {r["item_id"]: r for r in read_jsonl(files.requests())}
+    assert all(r["params"] == first[r["item_id"]]["params"] for r in retry)   # the same request, sent again
 
-    # line_loc traces recover; cvss stays refused. DPO cvss recovers; line_loc falls to the rule.
-    write_generations(files.requests("trace", True), lambda r: (
-        (f"Second look.\n{bank[r['item_id']]['target']}", "end_turn") if r["type"] == "line_loc"
-        else ("", "refusal", "reasoning_extraction")), meta=True)
-    write_generations(files.requests("dpo", True), lambda r: (
+    # cvss recovers at the regeneration; line_loc falls to the rule.
+    write_generations(files.requests(retry=True), lambda r: (
         (json.dumps({"vector": "AV:L/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}), "end_turn") if r["type"] == "cvss"
         else (json.dumps({"lines": []}), "end_turn")), meta=True)
     assert run(data, "build") == 0
 
-    rows = read_jsonl(files.distill_external)
-    assert [r["item_id"] for r in rows] == list(bank)
     by_type = lambda rs, t: [r for r in rs if r["type"] == t]  # noqa: E731
-    assert {r["source"] for r in by_type(rows, "line_loc")} == {"ext_a2"}
-    assert {r["source"] for r in by_type(rows, "cvss")} == {"gold_only"}
-    assert all(r["source"] == "ext_a1" and r["correct"] for r in by_type(rows, "mcq"))
-
     pairs = read_jsonl(files.dpo)
     assert [r["item_id"] for r in pairs] == list(bank)
     graph = GRAPH
@@ -354,10 +277,10 @@ def test_end_to_end(data):
 
     rep = json.loads(files.report_json.read_text())
     assert rep["dpo"]["types"]["mcq"]["rule_defined"] and rep["dpo"]["types"]["line_loc"]["rule_fallback_rate"] == "1"
-    assert rep["distill_external"]["types"]["cvss"]["refusal_categories"] == {"reasoning_extraction": 16}
-    assert set(rep["usage"]) == {"trace", "trace_retry", "dpo", "dpo_retry"} and rep["total_cost_usd"] > 0
-    assert files.report_md.read_text().startswith("# Step 6: external-model jobs")
-    assert set(rep["sources"]) >= {"trace_requests_sha256", "dpo_retry_generations_sha256", "dpo_sha256"}
+    assert rep["dpo"]["types"]["cvss"]["sources"] == {"model_a1": 0, "model_a2": 8, "rule": 0}
+    assert set(rep["usage"]) == {"dpo", "dpo_retry"} and rep["total_cost_usd"] > 0
+    assert files.report_md.read_text().startswith("# Step 6: DPO rejected answers")
+    assert set(rep["sources"]) >= {"dpo_requests_sha256", "dpo_retry_generations_sha256", "dpo_sha256"}
 
 
 def test_pilot_report(data, monkeypatch):
@@ -365,26 +288,25 @@ def test_pilot_report(data, monkeypatch):
     run(data, "prepare", "--pilot")
     files = TeacherFiles.of(data, pilot=True)
     bank = bank_of(data)
-    write_generations(files.requests("trace"), lambda r: (f"Because.\n{bank[r['item_id']]['target']}", "end_turn"), meta=True)
-    write_generations(files.requests("dpo"), lambda r: ("", "refusal", "cyber"), meta=True)
+    write_generations(files.requests(), lambda r: (
+        ("", "refusal", "cyber") if r["type"] == "cvss" else (json.dumps({"cwe": "CWE-787"}), "end_turn")), meta=True)
     assert run(data, "pilot-report") == 0
     out = json.loads(files.pilot_report_json.read_text())
     assert out["pilot_cves"] == 2 and out["scale_to_full_run"] == 4
-    assert out["trace"]["mcq"] == {**out["trace"]["mcq"], "n": 2, "valid_a1": 2, "correct": 2}
-    assert out["dpo"]["cvss"]["refusal_categories"] == {"cyber": 2}
-    trace_cost = (12 * 100 * 4 + 12 * 10 * 20) / 1e6
-    assert out["cost_usd"]["trace"]["full_run_estimate"] == round(trace_cost * 4, 2)
+    assert out["types"]["cvss"] == {"n": 2, "valid_a1": 0, "reasons": {"refusal": 2}, "refusal_categories": {"cyber": 2}}
+    assert out["types"]["find_error"]["n"] == 4 and "mcq" not in out["types"]
+    pilot_cost = (10 * 100 * 4 + 10 * 10 * 20) / 1e6
+    assert out["cost_usd"]["full_run_estimate"] == round(pilot_cost * 4, 2)
 
 
 def test_real_request_files_match_pins():
     files = TeacherFiles.of(DEFAULT)
-    if not files.requests("trace").exists():
+    if not files.requests().exists():
         pytest.skip("data/teacher not prepared")
     bank = read_jsonl(BankFiles.of(DEFAULT).bank("nontest"))
-    for job in pinned.TEACHER_JOBS:
-        requests = external.load_requests(files.requests(job))
-        external.check_request_pins(requests)
-        assert len(requests) == sum(prepare.wanted(job, r) for r in bank)
+    requests = external.load_requests(files.requests())
+    external.check_request_pins(requests)
+    assert len(requests) == sum(prepare.wanted(r) for r in bank) == 9_665
 
 
 GRAPH = load_cwe_graph(DEFAULT.cwe_xml)

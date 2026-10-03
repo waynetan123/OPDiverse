@@ -2,7 +2,7 @@
 
 Test whether different post-training objectives produce teacher models with distinct and complementary skill profiles.
 
-Four post-trained arms plus a control, with two additional arms reported descriptively. All arms train on the same facts and the same prompts. What differs is the learning signal: imitate a target string (SFT), imitate a reasoning trace (distillation), prefer one completion over another (DPO), or maximise a verifiable reward (GRPO). If performance diverges across question types, that divergence is attributable to the objective, subject to the compute-matching caveat below.
+Four post-trained arms plus a control, with one additional arm (SFT→DPO) reported descriptively. A second, distill-external, was planned and dropped at step 6. All arms train on the same facts and the same prompts. What differs is the learning signal: imitate a target string (SFT), imitate a reasoning trace (distillation), prefer one completion over another (DPO), or maximise a verifiable reward (GRPO). If performance diverges across question types, that divergence is attributable to the objective, subject to the compute-matching caveat below.
 
 The secondary question — and the one that makes the result non-trivial — is whether any observed advantage is a real transferable skill or just familiarity with an output format.
 
@@ -10,13 +10,13 @@ The secondary question — and the one that makes the result non-trivial — is 
 
 **Backbone.** A Qwen-family 7B instruct checkpoint, named and version-pinned in-repo. One backbone for every arm.
 
-**External model.** A single named external LLM, Claude Opus 5.5 (`claude-opus-5-5`, effort `medium`), does four jobs:
+**External model.** A single named external LLM, Claude Opus 5.5 (`claude-opus-5-5`, effort `medium`), was pinned for four jobs; three ran (distill-external's traces were refused at step 6):
 - chooses the MCQ distractors;
-- supplies distill-external's reasoning traces;
+- supplies distill-external's reasoning traces (refused at step 6; the arm is dropped);
 - writes every DPO rejected completion except MCQ's, which is rule-defined (the distractor closest to gold in the hierarchy);
 - stands as the substitution source for distill-self if its self-generated rationales fail the quality bar.
 
-One model, one configuration, four jobs, so that any finding about externally sourced data is a finding about one identified system rather than an unspecified mixture. It has no dated snapshot and accepts no sampling parameters. Its outputs are therefore cached and audited rather than regenerated. Pins are in `docs/decisions/step4_decision_record.md`.
+One model, one configuration, every external job, so that any finding about externally sourced data is a finding about one identified system rather than an unspecified mixture. It has no dated snapshot and accepts no sampling parameters. Its outputs are therefore cached and audited rather than regenerated. Pins are in `docs/decisions/step4_decision_record.md`.
 
 ## Architecture
 
@@ -28,7 +28,7 @@ PrimeVul   ───┘   (join on        (test window drawn     (6 items per   
                                    alone)
 ```
 
-**Pipeline ordering is load-bearing.** The bank is generated _after_ the test window is drawn and _before_ any per-seed partition. That ordering is what makes the generated artifacts — distill-self rationales, distill-external traces, DPO negatives — cacheable static files reusable across every seed and every matrix, which the compute budget depends on. An earlier draft generated the bank from "training and dev facts," which are per-seed quantities; that would have forced regeneration of ~20,000 items three times over and made the cached-file claim false. It also ran the signal audit and rationale generation _before_ the bank existed, which is simply unrunnable. Corrected below.
+**Pipeline ordering is load-bearing.** The bank is generated _after_ the test window is drawn and _before_ any per-seed partition. That ordering is what makes the generated artifacts — distill-self rationales and DPO negatives (and distill-external traces, as planned) — cacheable static files reusable across every seed and every matrix, which the compute budget depends on. An earlier draft generated the bank from "training and dev facts," which are per-seed quantities; that would have forced regeneration of ~20,000 items three times over and made the cached-file claim false. It also ran the signal audit and rationale generation _before_ the bank existed, which is simply unrunnable. Corrected below.
 
 **Fact table.** One row per CVE, keyed on CVE ID, carrying description, CWE, sibling CWEs, CVSS v3.x base vector, vulnerable function, patched function, patch line set, publication date. Rows missing any field are dropped; an empty sibling list is a value, not a missing field. Functions come from PrimeVul v0.1's paired files. Where a CVE has several vulnerable functions, one is kept: the function named in the NVD description, else a fixed hash choice. Pins and outcomes are in `docs/decisions/step1_decision_record.md`.
 
@@ -97,9 +97,9 @@ For an 800-token function (roughly the fact-table median) generating 8 rollouts 
 |Rollout sampling|One sampling config used identically for GRPO training rollouts and for the signal audit: TRL's GRPO defaults, temperature 1.0, top-p 1.0|
 |Rollout / audit caps|Per type, the smallest of {MCQ 16 / exact-ID 24 / CVSS 48 / find-the-error 64 / line localisation 64, 128, 256, 512} at which ≤ 10% of audit rollouts are cut off, measured by sampling the audit once at 512 tokens. Stop on end-of-sequence only. Pins in `docs/decisions/step5_decision_record.md`|
 |**Evaluation caps**|**512 tokens, uniform across all arms and types**|
-|External model|Claude Opus 5.5, effort `medium`, for MCQ distractors, distill-external traces, DPO negatives, and the distill-self substitution source|
+|External model|Claude Opus 5.5, effort `medium`, for MCQ distractors, DPO negatives, and the distill-self substitution source (distill-external traces: refused, arm dropped at step 6)|
 
-**Why evaluation caps are uniform and generous.** Tight caps suit GRPO rollouts, where the model is being trained toward terse answers and every arm sees the same cap on the same untrained base — provided the base model's replies fit them. The bank's templates ask for the answer at the end of the reply, which invites reasoning first, so a fixed 16-token cap could cut off every rollout and floor a column for a length setting. The rollout cap per type is therefore set by the audit's cut-off rate under a pre-registered rule (step 5). They are wrong at evaluation, because distill-self and distill-external are trained to reason before answering. A 24-token evaluation cap would truncate those arms while leaving SFT intact — an efficiency setting that silently penalises specific arms and would be read as an objective effect. Decode is cheap when a model stops early, so a 512 cap costs little and binds only on the arms that must not be truncated.
+**Why evaluation caps are uniform and generous.** Tight caps suit GRPO rollouts, where the model is being trained toward terse answers and every arm sees the same cap on the same untrained base — provided the base model's replies fit them. The bank's templates ask for the answer at the end of the reply, which invites reasoning first, so a fixed 16-token cap could cut off every rollout and floor a column for a length setting. The rollout cap per type is therefore set by the audit's cut-off rate under a pre-registered rule (step 5). They are wrong at evaluation, because distill-self is trained to reason before answering. A 24-token evaluation cap would truncate those arms while leaving SFT intact — an efficiency setting that silently penalises specific arms and would be read as an objective effect. Decode is cheap when a model stops early, so a 512 cap costs little and binds only on the arms that must not be truncated.
 
 **Engine-agreement check, before any results exist.** Take one checkpoint, score it on dev under both HuggingFace and vLLM, confirm agreement. Different kernels and floating-point accumulation orders can flip a near-tie under greedy decoding. If the two disagree materially, that must be known before the results exist, not after.
 
@@ -114,7 +114,7 @@ For an 800-token function (roughly the fact-table median) generating 8 rollouts 
 
 Because the pool is _all_ non-test items rather than one seed's train set, this file is generated once and every seed's partition reads from it. That is the entire reason the ordering was changed.
 
-**2. External-model jobs.** distill-external traces (11,598) and DPO rejected completions (9,665; MCQ needs no request) run against the pinned external model over the same frozen non-test item pool. Both produce static files, cached to disk, generated once and reused across every seed and matrix. Pin the model and its configuration, archive the generation prompts, and record request-level metadata so the files can be audited. They cannot be regenerated identically, because the model has no dated snapshot and no sampling control, so the cached files are the artifact. Pins in `docs/decisions/step6_decision_record.md`.
+**2. External-model jobs.** DPO rejected completions (9,665; MCQ needs no request) run against the pinned external model over the same frozen non-test item pool. distill-external traces were planned here too, but the model refused them at the step-6 pilot and the arm is dropped. The DPO job produces a static file, cached to disk, generated once and reused across every seed and matrix. Pin the model and its configuration, archive the generation prompts, and record request-level metadata so the files can be audited. They cannot be regenerated identically, because the model has no dated snapshot and no sampling control, so the cached files are the artifact. Pins in `docs/decisions/step6_decision_record.md`.
 
 **3. GRPO rollouts.** TRL `GRPOTrainer` with `use_vllm=True`, `num_generations=8` (which becomes `n=8` with prefix sharing), per-type completion caps, and `gpu_memory_utilization` tuned against OOM. Deployment mode — `colocate` (all four cards run full GRPO jobs) versus `server` (one card serves inference, three train) — is decided by measurement on a single pilot run, not by assumption. Colocate is the likely choice on 4×A40, since a 7B in bf16 is 14GB and the workload is ~24 independent GRPO runs that parallelise trivially across cards.
 
@@ -127,7 +127,7 @@ An efficiency change applied to some arms and not others is a confound. Everythi
 - **One training job per GPU.** A 7B with LoRA fits on a single A40. Sharding across four cards with FSDP or ZeRO-3 gains nothing and costs 30–50% to PCIe communication on hardware without NVLink. The workload is 120 embarrassingly parallel runs; run four at once.
 - **Flash Attention 2** everywhere (Ampere is supported).
 - **Gradient checkpointing off** unless memory measurement says otherwise. It trades ~30% more compute for memory you likely do not need.
-- **Sequence packing** for the cross-entropy arms (base, SFT, distill-self, distill-external), with attention masking so no sequence attends across a document boundary. Structurally inapplicable to DPO (paired) and GRPO (per-prompt groups); recorded in the per-arm config rather than treated as an oversight.
+- **Sequence packing** for the cross-entropy arms (base, SFT, distill-self), with attention masking so no sequence attends across a document boundary. Structurally inapplicable to DPO (paired) and GRPO (per-prompt groups); recorded in the per-arm config rather than treated as an oversight.
 - **Length bucketing** for DPO and GRPO, recovering most of what packing would have.
 - **LoRA rank 16** on attention and MLP projections, identical across all arms.
 
@@ -310,10 +310,10 @@ The prompt is byte-identical across all arms. Only what sits beside it changes. 
 |Distill-self|primary|prompt + own hint-conditioned rationales|base model writes a rationale _given the gold answer_; rationale + gold answer is the target|
 |DPO-from-base|primary|prompt + chosen/rejected|chosen is gold; rejected written by the external model in identical format|
 |GRPO|primary|prompt + verifier|k=8 rollouts, dense reward, group-normalised advantage|
-|Distill-external|secondary|prompt + external traces|written-out reasoning from the external model|
+|~~Distill-external~~|dropped at step 6|—|planned: written-out reasoning from the external model; refused|
 |SFT→DPO|secondary|prompt + chosen/rejected|DPO initialised from the SFT checkpoint|
 
-Base, SFT and both distill arms never touch a verifier for data selection. Every shaping decision lands in DPO and GRPO only. No converter can delete a row from another converter's file.
+Base, SFT and distill-self never touch a verifier for data selection. Every shaping decision lands in DPO and GRPO only. No converter can delete a row from another converter's file.
 
 ### Distillation — two arms, the substitution rule, and what it costs
 
@@ -340,11 +340,12 @@ _What it costs, stated plainly._ A substituted column is no longer independent o
 - The **leave-flagged-columns-out sensitivity run** covers substituted cells as well as floored ones.
 - If substitution fires on **three or more of the five types**, distill-self has effectively become distill-external and must not be reported as an independent arm. In that case, drop distill-self from the primary test, run it on three arms (SFT, DPO, GRPO), and say so. Pre-registering this prevents a quietly-contaminated fourth row from carrying the headline.
 
-**distill-external** uses the same external model to generate unhinted traces in the ordinary way, reported descriptively, never in the interaction test. A strong teacher makes the row carry two explanations at once, which cannot be separated, and a contaminated row distorts the interaction statistic for all four arms rather than only its own cell. The gap between the two distill arms bounds how much of the benefit is teacher capability rather than the presence of reasoning in the target — a bound that becomes uninformative for any substituted type, which is another reason to record substitution per type.
+_Not run (step 6):_ the external model refused all 120 pilot trace requests under its `reasoning_extraction` category, so distill-external is dropped. No trace was generated and the arm is not trained. See `docs/decisions/step6_decision_record.md`. **What this loses:** the gap between the two distill arms, which would have bounded how much of a distill benefit is teacher capability rather than the presence of reasoning in the target. The write-up states that the bound is unavailable. distill-self's reading — "producing intermediate reasoning before answering helps" — is unaffected.
+
+**distill-external** (as planned) uses the same external model to generate unhinted traces in the ordinary way, reported descriptively, never in the interaction test. A strong teacher makes the row carry two explanations at once, which cannot be separated, and a contaminated row distorts the interaction statistic for all four arms rather than only its own cell. The gap between the two distill arms bounds how much of the benefit is teacher capability rather than the presence of reasoning in the target — a bound that becomes uninformative for any substituted type, which is another reason to record substitution per type.
 
 A summarised trace is a different object from a full one, and a reviewer will flag distillation on it. The pinned external model, Claude Opus 5.5, never returns its hidden reasoning, so a trace here is the reasoning the model writes out in its reply before the answer. The owner has permission to request this. The write-up calls it written-out reasoning, not raw chain-of-thought. Report the dense-score distribution of external traces per type as a covariate.
 
-_Pinned at step 6:_ the request is the item's own question, unhinted, asking for reasoning of at most 250 words before the answer. The training prompt stays byte-identical. A trace must fit the evaluation budget, as distill-self's rationales do: reasoning plus canonical answer at most 511 backbone tokens. Otherwise the arm would learn to reason past the 512-token evaluation cap and be truncated for a length setting. Wrong answers are kept, since no verifier selects distill data; the final line is canonicalised to the trace's own answer, so no target contradicts itself. Refused, cut-off, answerless or over-long traces are regenerated once, then fall back to the gold answer alone. Pins in `docs/decisions/step6_decision_record.md`.
 
 ### DPO — initialisation, reference policy, negatives
 
@@ -393,7 +394,6 @@ The earlier plan swept LR for every arm _and_ β for DPO, while GRPO's analogous
 |Distill-self|LR ∈ {3}|epochs|
 |DPO-from-base|LR ∈ {3}|**β**|
 |GRPO|LR ∈ {3}|**KL coefficient**, k=8 rollouts|
-|Distill-external|LR ∈ {3}|epochs|
 |SFT→DPO|LR ∈ {3}|β|
 
 State the configuration count per arm in the paper.
@@ -410,8 +410,8 @@ State the configuration count per arm in the paper.
 2. **Draw the frozen test window:** chronologically latest 15%, by publication date. Verify no CVE ID or near-duplicate function crosses the boundary. Report N moved.
 3. **Contamination probe** on the raw backbone, over 300 CVEs from the drawn test window. Record the result and the decision-rule outcome.
 4. **Generate the question bank, once.** One pass over the whole non-test pool, one pass over the test pool. Six items per CVE. MCQ distractors proposed by the external model and admitted by rule, with the shortcut guard applied. Options frozen, gold letters assigned by CVE-ID hash; report realised per-letter marginals per pool. Freeze the bank.
-5. **Frozen-model vLLM session:** run the GRPO signal audit on non-test items and set the per-type rollout caps (the DPO and distill-external audit lines need step 6's outputs and are computed there); generate distill-self hint-conditioned rationales over the **whole non-test pool**; cache to disk keyed by `(CVE ID, type, item index)`. Evaluate the **substitution trigger** per type and record which types, if any, will draw rationales from the external model.
-6. **External-model jobs:** generate distill-external traces and all DPO rejected completions over the whole non-test pool, plus substituted distill-self rationales where triggered (none: step 5 substituted no type). A 20-CVE pilot runs first and prices the full run; it decides nothing. Validate every rejection against its per-type rule; regenerate once, then rule-construct. Cache all outputs; report rule-fallback rates. Do not proceed until the audit, substitution decisions and fallback rates are recorded.
+5. **Frozen-model vLLM session:** run the GRPO signal audit on non-test items and set the per-type rollout caps (the DPO audit line needs step 6's outputs and is computed there; the distill-external line was never computed, as the arm was dropped); generate distill-self hint-conditioned rationales over the **whole non-test pool**; cache to disk keyed by `(CVE ID, type, item index)`. Evaluate the **substitution trigger** per type and record which types, if any, will draw rationales from the external model.
+6. **External-model jobs:** generate all DPO rejected completions over the whole non-test pool, plus substituted distill-self rationales where triggered (none: step 5 substituted no type). A 20-CVE pilot runs first and prices the full run. distill-external traces were planned here; the pilot's trace requests were all refused, and the arm is dropped. Validate every rejection against its per-type rule; regenerate once, then rule-construct. Cache all outputs; report rule-fallback rates. Do not proceed until the audit, substitution decisions and fallback rates are recorded.
 7. Run the **engine-agreement check** (HF versus vLLM on one checkpoint, dev only). Freeze the primary-test implementation.
 8. **For each seed, partition the non-test pool:** late window = latest 20%, draw half at random as dev, rest to train, clusters intact. This is selection over the frozen bank — nothing is regenerated. Report inter-seed dev overlap.
 9. **Run the converters;** produce one training file per arm for this seed by selecting that seed's train items from the frozen bank and the cached artifact files.
@@ -451,15 +451,15 @@ The old version differs from M2 along an axis M2 never moved (total example coun
 
 |Component|Count|
 |---|---|
-|LR sweep: 7 arms × 3 LRs, M1 seed 0 only|21|
+|LR sweep: 6 arms × 3 LRs, M1 seed 0 only|18|
 |M1 keepers: 5 primary arms × 3 seeds|15|
 |M2 keepers: 4 post-trained arms × 5 types × 3 seeds|60|
 |Base noise floor: one leave-one-out config × 3 fresh seeds|3|
 |M1-volume: × 3 seeds|15|
-|Secondary at M1: distill-external, SFT→DPO × 3 seeds|6|
-|**Required total**|**120**|
+|Secondary at M1: SFT→DPO × 3 seeds|3|
+|**Required total**|**114**|
 
-The base arm's M2 equals its M1 by construction and is not re-run beyond the noise-floor configuration. If substitution fires on three or more types and distill-self is dropped from the primary test, M2 falls to 45 and the total to 105.
+The base arm's M2 equals its M1 by construction and is not re-run beyond the noise-floor configuration. If substitution fires on three or more types and distill-self is dropped from the primary test, M2 falls to 45 and the total to 99. (The total was 120 with distill-external, dropped at step 6: 3 sweep runs and 3 secondary runs.)
 
 **GPU-hours, with the vLLM integration and reduced selection:**
 
@@ -478,7 +478,7 @@ On 4×A40 at realistic utilisation: **4–8 days of wall clock**, with contingen
 
 **These are estimates, to be replaced.** Run one GRPO pilot — single config, reduced steps, dev-only evaluation — measuring colocate against server mode, and substitute measured per-arm GPU-hours for the table above before committing the cluster. This is not a power gate; it is a costing measurement.
 
-**Optional, only if the allocation allows:** the two secondary arms at M2 (2 × 5 × 3 = 30), and the token-matched secondary comparison, which must be costed explicitly before it is promised. If unfunded, remove the token-matched claim from the opening section rather than leaving it unsupported.
+**Optional, only if the allocation allows:** the secondary arm at M2 (1 × 5 × 3 = 15), and the token-matched secondary comparison, which must be costed explicitly before it is promised. If unfunded, remove the token-matched claim from the opening section rather than leaving it unsupported.
 
 **Scheduling.** GRPO dominates and appears in 15 of 60 M2 keepers plus its share of M1, M1-volume and the sweep. Cost in GPU-hours weighted by arm, not job counts, or the GRPO rows will overrun.
 
@@ -492,7 +492,7 @@ The underlying failure is shared: on a type where the base policy almost never p
 
 **DPO — near-miss constructibility.** Coverage is 100% by construction, so this measures the fraction of prompts where the external model produces a valid 1-hop negative without rule fallback, per type, with fallback reasons logged. MCQ's negative is rule-defined, so its line is reported as not applicable.
 
-**Distillation — rationale quality and the substitution trigger.** For distill-self: surface-validity pass rate, fallback-to-gold-only rate, and the fraction of rationales merely restating the hint. These feed the substitution rule directly. For distill-external: fraction of prompts where the teacher reaches the correct answer, plus dense-score distribution per type.
+**Distillation — rationale quality and the substitution trigger.** For distill-self: surface-validity pass rate, fallback-to-gold-only rate, and the fraction of rationales merely restating the hint. These feed the substitution rule directly. For distill-external: fraction of prompts where the teacher reaches the correct answer, plus dense-score distribution per type (not computed: the arm was dropped at step 6).
 
 **Decision rule**, per arm per type, fixed in advance:
 
@@ -645,9 +645,9 @@ No GPU time, no pilot required. A significant result is stronger for carrying it
 
 ### Scope of inference
 
-Everything else — M1, the gaps, the diagnostic columns, both secondary arms — is reported without inferential claims. With 20 cells and a second gap matrix, the multiple-comparison surface is large; the single pre-registered test prevents fishing.
+Everything else — M1, the gaps, the diagnostic columns, the secondary arm — is reported without inferential claims. With 20 cells and a second gap matrix, the multiple-comparison surface is large; the single pre-registered test prevents fishing.
 
-The base arm is excluded: its M2 values are copied from its M1 by construction rather than produced by the M2 procedure, and including a row generated differently would partly test "does an untrained model differ from trained ones," which is not the hypothesis. Base stays as an annotated reference line. distill-external and SFT→DPO are excluded because each carries a second explanation for any effect — and distill-self joins them if substitution fired on three or more types.
+The base arm is excluded: its M2 values are copied from its M1 by construction rather than produced by the M2 procedure, and including a row generated differently would partly test "does an untrained model differ from trained ones," which is not the hypothesis. Base stays as an annotated reference line. SFT→DPO is excluded because it carries a second explanation for any effect (as distill-external would have, had it run) — and distill-self joins them if substitution fired on three or more types.
 
 Line localisation and find-the-error share the same input function, so a leave-line-loc-out run still trains on that code through find-the-error. That is cross-type transfer, which is what M2 measures, not a leak — but the two columns are not independent and shouldn't be read as separate evidence for the same objective.
 

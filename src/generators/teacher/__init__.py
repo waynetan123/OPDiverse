@@ -1,1 +1,1 @@
-"""Step 6: external-model jobs over the frozen non-test bank (distill-external traces, DPO rejected answers)."""
+"""Step 6: the DPO rejected answers, written by the external model over the frozen non-test bank."""

@@ -1,4 +1,4 @@
-"""step6_report.{json,md} (the DPO and distill-external audit lines, usage and cost) and the pilot report."""
+"""step6_report.{json,md} (the DPO audit line, usage and cost) and the pilot report."""
 
 from __future__ import annotations
 
@@ -6,17 +6,14 @@ import json
 from collections import Counter
 from fractions import Fraction
 
-from etl import pinned
 from etl.build import write_json
-from etl.census import quantiles
 from etl.paths import Paths
-from etl.tokens import TokenCounter
 from frozen_model.prepare import load_bank
 
 from ..bank.build import load_inputs
 from ..bank.check import code_lines
 from ..bank.files import run_meta_for
-from . import dpo, traces
+from . import dpo
 from .files import TeacherFiles
 from .prepare import pilot_items
 from .results import load_results
@@ -31,17 +28,16 @@ def cost(usage: dict) -> float:
 
 
 def usage_section(files: TeacherFiles) -> dict:
-    """Per run (trace, trace_retry, dpo, dpo_retry): requests, token totals and cost, from the runner's run_meta."""
+    """Per run (dpo, dpo_retry): requests, token totals and cost, from the runner's run_meta."""
     out = {}
-    for job in pinned.TEACHER_JOBS:
-        for retry in (False, True):
-            meta_path = run_meta_for(files.requests(job, retry))
-            if meta_path.exists():
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                out[meta_path.stem.removesuffix("_run_meta")] = {
-                    "n_requests": meta["n_requests"], "usage": meta["usage_totals"],
-                    "cost_usd": round(cost(meta["usage_totals"]), 2), "stop_reasons": meta["stop_reasons"],
-                    "models": meta["models"], "git": meta["git"], "finished_utc": meta["finished_utc"]}
+    for retry in (False, True):
+        meta_path = run_meta_for(files.requests(retry))
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            out[meta_path.stem.removesuffix("_run_meta")] = {
+                "n_requests": meta["n_requests"], "usage": meta["usage_totals"],
+                "cost_usd": round(cost(meta["usage_totals"]), 2), "stop_reasons": meta["stop_reasons"],
+                "models": meta["models"], "git": meta["git"], "finished_utc": meta["finished_utc"]}
     return out
 
 
@@ -59,51 +55,37 @@ def write(paths: Paths, summary: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def pilot_report(paths: Paths, tokens: TokenCounter) -> dict:
-    """First-attempt validity on the pilot, refusals, trace lengths, and the full run's cost extrapolated from
-    the pilot's usage (the pilot holds every item of its CVEs, so the type mix matches the full pool)."""
+def pilot_report(paths: Paths) -> dict:
+    """First-attempt validity on the pilot, reasons, refusals, and the full run's cost extrapolated from the
+    pilot's usage (the pilot holds every item of its CVEs, so the type mix matches the full pool)."""
     files = TeacherFiles.of(paths, pilot=True)
     bank, _ = load_bank(paths)
     by_id = {r["item_id"]: r for r in bank}
     facts, _, graph = load_inputs(paths)
     code = {f["cve_id"]: code_lines(f) for f in facts}
-    count = lambda text: tokens.count([text])[0]  # noqa: E731
     pilot_cves = len({r["cve_id"] for r in pilot_items(bank)})
     scale = len({r["cve_id"] for r in bank}) / pilot_cves
 
-    out = {"pilot_cves": pilot_cves, "scale_to_full_run": scale, "trace": {}, "dpo": {}, "cost_usd": {}}
-    for job in pinned.TEACHER_JOBS:
-        requests, results = load_results(files.requests(job))
-        per_type: dict[str, dict] = {}
-        for r in requests:
-            item, row = by_id[r["item_id"]], results[r["item_id"]]
-            s = per_type.setdefault(item["type"], {"n": 0, "valid": 0, "reasons": Counter(), "refusal_categories": Counter(),
-                                                    "correct": 0, "tokens": []})
-            s["n"] += 1
-            if job == "trace":
-                valid, reason = traces.validate(item, row, count, graph)
-                if valid:
-                    s["correct"] += valid["correct"]
-                    s["tokens"].append(valid["target_tokens"])
-            else:
-                reason = dpo.validate(item, row, code[item["cve_id"]], graph)[2]
-            s["valid"] += reason is None
-            if reason:
-                s["reasons"][reason] += 1
-            if reason == "refusal":
-                s["refusal_categories"][str(row["stop_category"])] += 1
-        for t, s in per_type.items():
-            entry = {"n": s["n"], "valid_a1": s["valid"], "reasons": dict(sorted(s["reasons"].items())),
-                     "refusal_categories": dict(sorted(s["refusal_categories"].items()))}
-            if job == "trace":
-                entry.update(correct=s["correct"], target_tokens=quantiles(s["tokens"]))
-            out[job][t] = entry
-        meta = json.loads(run_meta_for(files.requests(job)).read_text(encoding="utf-8"))
-        out["cost_usd"][job] = {"pilot": round(cost(meta["usage_totals"]), 2),
-                                "full_run_estimate": round(cost(meta["usage_totals"]) * scale, 2),
-                                "usage": meta["usage_totals"]}
-    out["cost_usd"]["full_run_estimate_total"] = round(sum(v["full_run_estimate"] for k, v in out["cost_usd"].items()
-                                                           if isinstance(v, dict)), 2)
+    requests, results = load_results(files.requests())
+    per_type: dict[str, dict] = {}
+    for r in requests:
+        item, row = by_id[r["item_id"]], results[r["item_id"]]
+        s = per_type.setdefault(item["type"], {"n": 0, "valid": 0, "reasons": Counter(), "refusal_categories": Counter()})
+        reason = dpo.validate(item, row, code[item["cve_id"]], graph)[2]
+        s["n"] += 1
+        s["valid"] += reason is None
+        if reason:
+            s["reasons"][reason] += 1
+        if reason == "refusal":
+            s["refusal_categories"][str(row["stop_category"])] += 1
+    meta = json.loads(run_meta_for(files.requests()).read_text(encoding="utf-8"))
+    out = {
+        "pilot_cves": pilot_cves, "scale_to_full_run": scale,
+        "types": {t: {"n": s["n"], "valid_a1": s["valid"], "reasons": dict(sorted(s["reasons"].items())),
+                      "refusal_categories": dict(sorted(s["refusal_categories"].items()))} for t, s in per_type.items()},
+        "cost_usd": {"pilot": round(cost(meta["usage_totals"]), 2),
+                     "full_run_estimate": round(cost(meta["usage_totals"]) * scale, 2), "usage": meta["usage_totals"]},
+    }
     write_json(files.pilot_report_json, out)
     files.pilot_report_md.write_text(render_pilot(out), encoding="utf-8")
     return out
@@ -122,40 +104,25 @@ BAND_LABELS = {"as_specified": "≥ 50%", "report_quality": "10–50%", "floored
 
 
 def render_markdown(r: dict) -> str:
-    de, dp = r["distill_external"]["types"], r["dpo"]["types"]
-    trace_rows = [
-        f"| {t} | {s['n']:,} | {_pct(s['valid_rate_a1'])} | {s['sources']['ext_a2']:,} | {_pct(s['fallback_rate'])} "
-        f"| {_pct(s['correct_rate'])} | {BAND_LABELS[s['band']]} | {dict(s['target_tokens_quantiles']).get('p50', '—')} "
-        f"/ {dict(s['target_tokens_quantiles']).get('p100', '—')} |"
-        for t, s in de.items()]
-    dpo_rows = [
+    dp = r["dpo"]["types"]
+    rows = [
         f"| {t} | {s['n']:,} | {_pct(s['constructible_a1'])} | {s['sources']['model_a2']:,} | {_pct(s['rule_fallback_rate'])} "
         f"| {BAND_LABELS[s['band']]} | {s['rejected_dense']} |"
         for t, s in dp.items()]
     usage = [f"| {k} | {u['n_requests']:,} | {u['usage'].get('input_tokens', 0):,} | {u['usage'].get('output_tokens', 0):,} "
              f"| ${u['cost_usd']:,.2f} |" for k, u in r["usage"].items()]
-    reasons = [f"- distill-external {t}: attempt 1 {s['a1_reasons'] or '—'}; regeneration {s['a2_reasons'] or '—'}; "
-               f"refusal categories {s['refusal_categories'] or '—'}" for t, s in de.items()]
-    reasons += [f"- DPO {t}: attempt 1 {s['a1_reasons'] or '—'}; regeneration {s['a2_reasons'] or '—'}; "
-                f"refusal categories {s['refusal_categories'] or '—'}" for t, s in dp.items() if not s["rule_defined"]]
+    reasons = [f"- {t}: attempt 1 {s['a1_reasons'] or '—'}; regeneration {s['a2_reasons'] or '—'}; "
+               f"refusal categories {s['refusal_categories'] or '—'}" for t, s in dp.items() if not s["rule_defined"]]
     return "\n".join([
-        "# Step 6: external-model jobs", "",
+        "# Step 6: DPO rejected answers", "",
         f"{r['n_items']:,} non-test items; external model `{r['external_model']['model']}`, effort "
-        f"`{r['external_model']['effort']}`.", "",
-        "## distill-external traces", "",
-        f"A trace is valid if the reply ended on its own, its last line is a complete answer in the target format, it has "
-        f"reasoning above that line, and reasoning plus answer fit {r['distill_external']['rule']['max_target_tokens']} backbone "
-        "tokens. Wrong answers are kept. Invalid first attempts are regenerated once, then fall back to the gold answer. "
-        "The band is read on the share of items where the teacher reaches the correct answer.", "",
-        "| Type | Items | Valid (attempt 1) | Recovered by regeneration | Gold only | Teacher correct | Band | Target tokens p50 / max |",
-        "|---|---|---|---|---|---|---|---|",
-        *trace_rows, "",
-        "## DPO rejected answers", "",
+        f"`{r['external_model']['effort']}`. Chosen is the gold target; rejected is a near miss one unit of error "
+        "from gold, in the same format.", "",
         "Constructible = a valid near miss from the external model at the first attempt, without the rule. MCQ sends no "
         "request: its rejected letter is the distractor closest to gold in the hierarchy.", "",
         "| Type | Items | Constructible (attempt 1) | Recovered by regeneration | Rule fallback | Band | Rejected scores (dense: count) |",
         "|---|---|---|---|---|---|---|",
-        *dpo_rows, "",
+        *rows, "",
         "## Failure reasons", "",
         *reasons, "",
         "## Usage", "",
@@ -166,21 +133,15 @@ def render_markdown(r: dict) -> str:
 
 
 def render_pilot(r: dict) -> str:
-    lines = ["# Step 6: pilot", "",
-             f"{r['pilot_cves']} non-test CVEs, every item, both jobs, first attempt only. The pilot decides nothing; "
-             "it checks the prompts, refusals and trace lengths, and prices the full run.", ""]
-    for job in pinned.TEACHER_JOBS:
-        lines += [f"## {job}", "", "| Type | Items | Valid | Reasons | Refusal categories |"
-                  + (" Correct | Target tokens p50 / max |" if job == "trace" else ""),
-                  "|---|---|---|---|---|" + ("---|---|" if job == "trace" else "")]
-        for t, s in r[job].items():
-            row = f"| {t} | {s['n']} | {s['valid_a1']} | {s['reasons'] or '—'} | {s['refusal_categories'] or '—'} |"
-            if job == "trace":
-                q = dict(s["target_tokens"])
-                row += f" {s['correct']} | {q.get('p50', '—')} / {q.get('p100', '—')} |"
-            lines.append(row)
-        c = r["cost_usd"][job]
-        lines += ["", f"Cost: ${c['pilot']:,.2f} for the pilot; full run ≈ **${c['full_run_estimate']:,.2f}**.", ""]
-    lines += [f"**Full run, both jobs, first attempt: ≈ ${r['cost_usd']['full_run_estimate_total']:,.2f}** "
-              "(regenerations add their share of the invalid rate).", ""]
-    return "\n".join(lines)
+    rows = [f"| {t} | {s['n']} | {s['valid_a1']} | {s['reasons'] or '—'} | {s['refusal_categories'] or '—'} |"
+            for t, s in r["types"].items()]
+    c = r["cost_usd"]
+    return "\n".join([
+        "# Step 6: DPO pilot", "",
+        f"{r['pilot_cves']} non-test CVEs, every non-MCQ item, first attempt only. The pilot decides nothing; it checks "
+        "the prompts and refusals, and prices the full run.", "",
+        "| Type | Items | Valid | Reasons | Refusal categories |", "|---|---|---|---|---|",
+        *rows, "",
+        f"Cost: ${c['pilot']:,.2f} for the pilot; full run, first attempt ≈ **${c['full_run_estimate']:,.2f}** "
+        "(regenerations add their share of the invalid rate).", "",
+    ])

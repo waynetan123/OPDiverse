@@ -13,7 +13,7 @@ The secondary question — and the one that makes the result non-trivial — is 
 **External model.** A single named external LLM, Claude Opus 5.5 (`claude-opus-5-5`, effort `medium`), does four jobs:
 - chooses the MCQ distractors;
 - supplies distill-external's reasoning traces;
-- writes every DPO rejected completion;
+- writes every DPO rejected completion except MCQ's, which is rule-defined (the distractor closest to gold in the hierarchy);
 - stands as the substitution source for distill-self if its self-generated rationales fail the quality bar.
 
 One model, one configuration, four jobs, so that any finding about externally sourced data is a finding about one identified system rather than an unspecified mixture. It has no dated snapshot and accepts no sampling parameters. Its outputs are therefore cached and audited rather than regenerated. Pins are in `docs/decisions/step4_decision_record.md`.
@@ -114,7 +114,7 @@ For an 800-token function (roughly the fact-table median) generating 8 rollouts 
 
 Because the pool is _all_ non-test items rather than one seed's train set, this file is generated once and every seed's partition reads from it. That is the entire reason the ordering was changed.
 
-**2. External-model jobs.** distill-external traces (~20,000) and DPO rejected completions (~20,000) run against the pinned external model over the same frozen non-test item pool. Both produce static files, cached to disk, generated once and reused across every seed and matrix. Pin the model and its configuration, archive the generation prompts, and record request-level metadata so the files can be audited. They cannot be regenerated identically, because the model has no dated snapshot and no sampling control, so the cached files are the artifact.
+**2. External-model jobs.** distill-external traces (11,598) and DPO rejected completions (9,665; MCQ needs no request) run against the pinned external model over the same frozen non-test item pool. Both produce static files, cached to disk, generated once and reused across every seed and matrix. Pin the model and its configuration, archive the generation prompts, and record request-level metadata so the files can be audited. They cannot be regenerated identically, because the model has no dated snapshot and no sampling control, so the cached files are the artifact. Pins in `docs/decisions/step6_decision_record.md`.
 
 **3. GRPO rollouts.** TRL `GRPOTrainer` with `use_vllm=True`, `num_generations=8` (which becomes `n=8` with prefix sharing), per-type completion caps, and `gpu_memory_utilization` tuned against OOM. Deployment mode — `colocate` (all four cards run full GRPO jobs) versus `server` (one card serves inference, three train) — is decided by measurement on a single pilot run, not by assumption. Colocate is the likely choice on 4×A40, since a 7B in bf16 is 14GB and the workload is ~24 independent GRPO runs that parallelise trivially across cards.
 
@@ -187,7 +187,7 @@ The v3.x requirement still truncates the old end of the range, which is what the
 
 **Parity check after the census, before any split:** compare mean per-component agreement of the majority baseline on v3.0 rows against v3.1 rows. Investigate if they differ materially.
 
-Also pinned: diff normalisation; insertion attribution; the 20% patch threshold and insertion guard; the 10,000-token function cap; the line-set matcher; MCQ gold-letter assignment; near-miss construction rules and the external model's identity and version; fixed second-knob values; the vLLM version and both sampling configurations; all answer parsers.
+Also pinned: diff normalisation; insertion attribution; the 20% patch threshold and insertion guard; the 10,000-token function cap; the line-set matcher; MCQ gold-letter assignment; near-miss construction rules, the trace and near-miss prompts, and the external model's identity and version; fixed second-knob values; the vLLM version and both sampling configurations; all answer parsers.
 
 ## Splits
 
@@ -344,6 +344,8 @@ _What it costs, stated plainly._ A substituted column is no longer independent o
 
 A summarised trace is a different object from a full one, and a reviewer will flag distillation on it. The pinned external model, Claude Opus 5.5, never returns its hidden reasoning, so a trace here is the reasoning the model writes out in its reply before the answer. The owner has permission to request this. The write-up calls it written-out reasoning, not raw chain-of-thought. Report the dense-score distribution of external traces per type as a covariate.
 
+_Pinned at step 6:_ the request is the item's own question, unhinted, asking for reasoning of at most 250 words before the answer. The training prompt stays byte-identical. A trace must fit the evaluation budget, as distill-self's rationales do: reasoning plus canonical answer at most 511 backbone tokens. Otherwise the arm would learn to reason past the 512-token evaluation cap and be truncated for a length setting. Wrong answers are kept, since no verifier selects distill data; the final line is canonicalised to the trace's own answer, so no target contradicts itself. Refused, cut-off, answerless or over-long traces are regenerated once, then fall back to the gold answer alone. Pins in `docs/decisions/step6_decision_record.md`.
+
 ### DPO — initialisation, reference policy, negatives
 
 **DPO-from-base** initialises from the same starting checkpoint as every other arm. π_ref is a frozen copy of that checkpoint. "Base" is ambiguous in this document, denoting both the raw backbone and the base arm (continued pretraining on raw text with LoRA); π_ref is the raw starting checkpoint, not the base arm's weights.
@@ -362,7 +364,7 @@ Log mean log-probability of chosen and rejected separately throughout training. 
 
 |Type|Rejected must be|Validity check|
 |---|---|---|
-|MCQ|the letter of the distractor closest to gold in the hierarchy|valid letter, not gold|
+|MCQ|the letter of the distractor closest to gold in the hierarchy (ties: the external model's step-4 order)|rule-defined at step 6: no request, not gold|
 |Exact-ID|a CWE exactly 1 hop from gold in CWE-1000|in-hierarchy, distance 1, not gold|
 |CVSS|gold with exactly one component changed|parses, exactly one component differs|
 |Find-the-error|on vulnerable functions, correct label with a 1-hop wrong CWE; on patched, flipped label with the most plausible CWE|fields valid, not gold|
@@ -409,7 +411,7 @@ State the configuration count per arm in the paper.
 3. **Contamination probe** on the raw backbone, over 300 CVEs from the drawn test window. Record the result and the decision-rule outcome.
 4. **Generate the question bank, once.** One pass over the whole non-test pool, one pass over the test pool. Six items per CVE. MCQ distractors proposed by the external model and admitted by rule, with the shortcut guard applied. Options frozen, gold letters assigned by CVE-ID hash; report realised per-letter marginals per pool. Freeze the bank.
 5. **Frozen-model vLLM session:** run the GRPO signal audit on non-test items and set the per-type rollout caps (the DPO and distill-external audit lines need step 6's outputs and are computed there); generate distill-self hint-conditioned rationales over the **whole non-test pool**; cache to disk keyed by `(CVE ID, type, item index)`. Evaluate the **substitution trigger** per type and record which types, if any, will draw rationales from the external model.
-6. **External-model jobs:** generate distill-external traces and all DPO rejected completions over the whole non-test pool, plus substituted distill-self rationales where triggered. Validate every rejection against its per-type rule; regenerate once, then rule-construct. Cache all outputs; report rule-fallback rates. Do not proceed until the audit, substitution decisions and fallback rates are recorded.
+6. **External-model jobs:** generate distill-external traces and all DPO rejected completions over the whole non-test pool, plus substituted distill-self rationales where triggered (none: step 5 substituted no type). A 20-CVE pilot runs first and prices the full run; it decides nothing. Validate every rejection against its per-type rule; regenerate once, then rule-construct. Cache all outputs; report rule-fallback rates. Do not proceed until the audit, substitution decisions and fallback rates are recorded.
 7. Run the **engine-agreement check** (HF versus vLLM on one checkpoint, dev only). Freeze the primary-test implementation.
 8. **For each seed, partition the non-test pool:** late window = latest 20%, draw half at random as dev, rest to train, clusters intact. This is selection over the frozen bank — nothing is regenerated. Report inter-seed dev overlap.
 9. **Run the converters;** produce one training file per arm for this seed by selecting that seed's train items from the frozen bank and the cached artifact files.
@@ -488,7 +490,7 @@ The underlying failure is shared: on a type where the base policy almost never p
 
 **GRPO — group variance.** 8 rollouts per prompt (one `n=8` request), measuring the fraction of groups with nonzero reward variance under both binary and dense scoring. GRPO normalises advantages within a group, A_i = (r_i − mean(r)) / std(r). If all rollouts score identically, every advantage is exactly zero and the prompt contributes no gradient. A group only teaches when its members disagree. At a 5% per-sample success rate with G=8, two-thirds of groups are dead; at 1%, 92% are. The run completes, the loss curve looks normal, and the reported number says "GRPO underperforms" when the truth is "GRPO took almost no steps."
 
-**DPO — near-miss constructibility.** Coverage is 100% by construction, so this measures the fraction of prompts where the external model produces a valid 1-hop negative without rule fallback, per type, with fallback reasons logged.
+**DPO — near-miss constructibility.** Coverage is 100% by construction, so this measures the fraction of prompts where the external model produces a valid 1-hop negative without rule fallback, per type, with fallback reasons logged. MCQ's negative is rule-defined, so its line is reported as not applicable.
 
 **Distillation — rationale quality and the substitution trigger.** For distill-self: surface-validity pass rate, fallback-to-gold-only rate, and the fraction of rationales merely restating the hint. These feed the substitution rule directly. For distill-external: fraction of prompts where the teacher reaches the correct answer, plus dense-score distribution per type.
 

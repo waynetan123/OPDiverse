@@ -1,7 +1,8 @@
-"""Pinned definitions for the OPDiverse fact table, test window, hierarchy scoring, probe, question bank and frozen-model session.
+"""Pinned definitions for the OPDiverse fact table, test window, hierarchy scoring, probe, question bank,
+frozen-model session and external-model jobs.
 
 Everything here can move a census count, a split or a score. It is frozen before step 0: any
-change needs a matching entry in docs/decisions/step{1,...,5}_decision_record.md. Pure functions,
+change needs a matching entry in docs/decisions/step{1,...,6}_decision_record.md. Pure functions,
 stdlib only, no I/O.
 """
 
@@ -264,6 +265,75 @@ HINT_LEAK = tuple(re.compile(p, re.IGNORECASE) for p in (
 # SUBSTITUTION_DROP_AT or more types, distill-self leaves the primary test.
 SUBSTITUTION_MAX = Fraction(1, 2)
 SUBSTITUTION_DROP_AT = 3
+
+# ---------------------------------------------------------------------------
+# External-model jobs (step 6): distill-external traces and DPO rejected answers
+# ---------------------------------------------------------------------------
+
+TEACHER_JOBS = ("trace", "dpo")
+TEACHER_PILOT_CVES = 20
+TEACHER_SALTS = {"pilot": "teacher-pilot", "dpo": "dpo-rule"}
+
+# distill-external: the item's own question, unhinted, with the reasoning written out in the reply. The
+# training prompt stays the item's `prompt`. The target (reasoning, a blank line, the canonical answer)
+# must fit the evaluation budget with its stop token (owner, step 6): at most TRACE_MAX_TOKENS - 1
+# tokens under the backbone tokenizer. Wrong answers are kept: no verifier selects distill data.
+TRACE_WORDS = 250
+TRACE_MAX_TOKENS = EVAL_MAX_TOKENS
+TRACE_PROMPT = (
+    "{user}\n\n"
+    "Before you answer, write out your reasoning step by step in plain prose, in at most {words} words. "
+    "Then give the answer alone on the last line, exactly in the form the question asks for."
+)
+
+# DPO: chosen is the gold target; rejected is a near miss one unit of error from gold, in the same
+# canonical format. The external model picks which near miss, the rules in generators.teacher.dpo decide
+# what is admissible, and a rule-constructed near miss fills in after one regeneration. MCQ sends no
+# request (owner, step 6): its rejected letter is the distractor closest to gold in the hierarchy.
+DPO_REQUEST_TYPES = ("exact_id", "cvss", "find_error", "line_loc")
+DPO_PROMPT = (
+    "I am building preference pairs to train a model on the question below. The correct answer is:\n{target}\n\n"
+    "I need the single most plausible wrong answer: the one a careful but mistaken expert would most likely "
+    "give. It must follow this rule: {rule}\n\n"
+    "The question, exactly as the model sees it:\n<question>\n{user}\n</question>"
+)
+# Keyed by type, and by find_error_{index} (0 vulnerable, 1 patched).
+DPO_RULES = {
+    "exact_id": (
+        "it must be one of these weaknesses, each one ChildOf step away from the correct answer in the "
+        "CWE-1000 Research Concepts view:\n{neighbours}\nGive its ID as CWE-<number>."
+    ),
+    "cvss": (
+        "change exactly one of the eight components of the correct vector to another valid value and keep the "
+        "other seven. Give the whole vector in the form AV:_/AC:_/PR:_/UI:_/S:_/C:_/I:_/A:_."
+    ),
+    "find_error_0": (
+        "keep the verdict that the function is vulnerable, but name a wrong weakness: one of these, each one "
+        "ChildOf step away from the correct one in the CWE-1000 Research Concepts view:\n{neighbours}\n"
+        "Give its ID as CWE-<number>."
+    ),
+    "find_error_1": (
+        "the function is the patched version of one whose vulnerability was {cwe}: {name}, so the wrong answer "
+        "calls it vulnerable. Give the weakness that someone who wrongly judged it vulnerable would most "
+        "plausibly name, as CWE-<number>: a weakness from CWE release {release}, not a category or view."
+    ),
+    "line_loc": (
+        "change the correct set of lines in exactly one way: either leave out one of the correct lines (only if "
+        "there are two or more), or replace one of them with a different code line at least 2 lines away from "
+        "it and not next to another correct line (answers within one line of a correct line are scored as "
+        "correct). Blank and comment-only lines never count. Give the line numbers in ascending order."
+    ),
+}
+DPO_FIELDS = {"exact_id": "cwe", "cvss": "vector", "find_error": "cwe", "line_loc": "lines"}
+DPO_SCHEMAS = {
+    field: {
+        "type": "object",
+        "properties": {field: {"type": "array", "items": {"type": "integer"}} if field == "lines" else {"type": "string"}},
+        "required": [field],
+        "additionalProperties": False,
+    }
+    for field in ("cwe", "vector", "lines")
+}
 
 # Deprecated CWE-1000 weaknesses -> replacement, read from each entry's Description in the
 # 4.20 XML. A replacement is recorded only where MITRE names exactly one successor; None

@@ -25,6 +25,14 @@ Under the pinned trace rules, every item would have fallen back to the gold answ
 - **Lost: the gap between the two distill arms,** which bounded how much of a distill benefit is teacher capability rather than reasoning in the target. The write-up states that the bound is unavailable.
 - **The substitution source for distill-self** would also have been unavailable, but no type was substituted.
 
+**Alternatives considered and not taken:**
+- *Have the use authorised on the account.* The plan states the owner has permission to request written-out reasoning; that permission would have to be applied to the API account by Anthropic. Applying it in a prompt is not possible. This would have kept the arm as pinned, at the cost of waiting on an outside decision.
+- *An open-weights teacher run on the project's GPUs.* This keeps a distill-external row, but breaks the one-external-model pin and changes the arm's meaning, from "Claude Opus 5.5's reasoning" to "a stronger open model's reasoning".
+- *Run the pinned rules anyway.* That would give a 100% gold-only file: SFT under another name, at the cost of about 23,000 refused requests.
+- *Server-side `fallbacks`*, which the refusal message suggests. The project forbids them because they switch models silently, and another Claude model does not change what the terms allow.
+
+**Why dropping it is acceptable:** distill-external was a secondary arm, reported descriptively and never in the pre-registered interaction test. Its traces were not needed for any other arm: distill-self's rationales came from the backbone at step 5, and no type was substituted. So the experiment's main question can be answered unchanged with distill-self as the only distillation arm.
+
 The trace pins committed at `80d4515` (`TRACE_PROMPT`, `TRACE_WORDS` = 250, the 511-token cap, the validity order) are removed from the code; git history keeps them.
 
 ## Pins
@@ -69,14 +77,37 @@ If a run is interrupted, or ends reporting failed requests, rerun the same comma
 
 ## Outcome
 
-To be recorded from `step6_report.md`.
+From `data/teacher/step6_report.md` and the two run metas. Both runs ran at clean `006d9e9`, `claude-opus-5-5` throughout, 8 workers, anthropic 1.10.0, Python 3.14.6. **`dpo.jsonl` was built for all 11,598 non-test items.**
 
 | | |
 |---|---|
-| DPO: constructible at attempt 1 / recovered / rule fallback / band, per type | |
-| Refusal categories | |
-| Usage and cost | |
-| sha256s of every request, generation and output file | |
+| Runs | **First attempt:** 9,665 requests, 2026-10-03 03:16–04:17 UTC; all 9,665 `end_turn`; no refusals; no transport errors. **Regeneration:** 114 requests, 05:29–05:30 UTC; all 114 `end_turn`; no refusals. |
+| Constructibility (the DPO audit line) | Every requested type is in the ≥ 50% band; **no type's negatives are rule-generated in substance.** Of 9,665 requested items, **9,601 (99.3%) carry the external model's near miss** (9,551 at the first attempt, 50 at the regeneration) and **64 (0.7%) the rule-built one**. MCQ's 1,933 are rule-defined by design. |
+| Refusal categories | None, in either run. |
+| Usage and cost | First attempt 20,511,127 input / 1,050,651 output tokens, **$103.06**. Regeneration 225,759 / 11,196, **$1.13**. **Total $104.19** at list price ($4 / $20 per MTok), against the pilot's estimate of ≈ $111. The pilots add $1.15 (DPO) and 203,573 input tokens (refused traces). |
+
+| Type | Items | Valid at attempt 1 | Recovered by regeneration | Rule fallback | Band | Rejected answer's dense score |
+|---|---|---|---|---|---|---|
+| MCQ | 1,933 | — | — | rule-defined | n/a | 0 for all (a wrong letter) |
+| Exact-ID | 1,933 | 1,933 (100.0%) | 0 | 0 (0.0%) | ≥ 50% | 1/2: 1,143 (a child of gold); 1/4: 790 (a parent) |
+| CVSS | 1,933 | 1,865 (96.5%) | 27 | 41 (2.1%) | ≥ 50% | 7/8 for all (one component of eight) |
+| Find-the-error | 3,866 | 3,866 (100.0%) | 0 | 0 (0.0%) | ≥ 50% | Patched: 0 for all 1,933 (label flipped). Vulnerable: 3/4 for 1,136 (child CWE), 5/8 for 797 (parent CWE) |
+| Line localisation | 1,933 | 1,887 (97.6%) | 23 | 23 (1.2%) | ≥ 50% | 0 for the 1,000 single-line items (line moved); 1/2 to 108/109 for the 933 multi-line items |
+
+- **CVSS failures** were 67 vectors with two or more components changed and one equal to gold. Opus tends to move linked components together (C, I and A); 41 of 68 did so again at the regeneration.
+- **Line-localisation failures** were 26 with more than one change, 18 moved only one line away (still matched under ±1), one equal to gold, and one still scoring F1 = 1. At the regeneration, 16 and 7 of these recurred.
+- **Exact-ID leans to children**: 59% of rejected CWEs are more specific than gold, so they score 1/2 under the direction-aware schedule rather than 1/4. The pairs' margin is therefore smaller on average for exact-ID than a parent-only rule would give.
+
+**sha256s**
+
+| File | sha256 |
+|---|---|
+| `dpo_requests.jsonl` | `6cb8e974…62fcae97` |
+| `dpo_generations.jsonl` | `a3834665…d61ff90f` |
+| `dpo_retry_requests.jsonl` | `eff4d56f…93d2d146` |
+| `dpo_retry_generations.jsonl` | `811fdcdb…afe754b7` |
+| `dpo.jsonl` | `73858599…6d5d9c5a` |
+| `step6_report.json` | `3e7b0e9b…38d41f06` |
 
 ## For later steps
 

@@ -87,3 +87,7 @@ From `data/probe/report.md` and `report.json`. Generations sha256 `78788b6e…fe
 - **`pinned.VLLM_VERSION`** is still `None`. Set it once the watermarking question is settled.
 
 *Step 5:* `pinned.VLLM_VERSION` is now `"0.30.0"`. Every later runner sets `watermarking=False` explicitly wherever the field exists, rather than relying on its default; `frozen_model.run_vllm --check-only` prints the vLLM source that defines it, recorded in `step5_decision_record.md`. The probe's own outputs stand as generated.
+
+*Resolved at step 5:* `watermarking` is a per-request switch for a watermark configured on the engine. The engine-level defaults in vLLM 0.30.0 are `watermark = 0.0` and `watermark_config = None`, and the probe passed neither, so no watermark was configured and the probe's outputs are plain greedy decoding. Watermarking is **not** behind the two determinism mismatches; those are batch-dependent floating-point differences (step 5 saw 18 of 20 on 512-token rationales). Details in `step5_decision_record.md`, Outcome.
+
+*Step 7:* the parser re-tuning promised above runs at step 7, on the untrained backbone's non-test replies (the step-5 audit and the engine check), never on probe replies. If it changes a parser (v2), the probe is re-scored and both versions are reported. Outcome: `step7_decision_record.md`.

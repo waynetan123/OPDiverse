@@ -21,14 +21,19 @@ from ..progress import track
 _OPTION_LINE = re.compile(r"[A-D]\. CWE-\d+: ")
 
 
+def code_lines(fact: dict) -> set[int]:
+    """1-indexed numbers of the vulnerable function's code lines (non-empty after comment masking,
+    when masking succeeded): the only lines gold, or a DPO near miss, may name."""
+    text = pinned.mask_comments(fact["vuln_func"])[0] if fact["comment_mask_ok"] else fact["vuln_func"]
+    return {i for i, line in enumerate(pinned.split_lines(text), 1) if pinned.line_key(line)}
+
+
 def line_numbering(fact: dict) -> list[str]:
     """The whole-table guard that replaces a manual read of the 50-item sheet: gold lines are
     in range and are code lines, and they are reproducible from the two stored functions."""
     cve, lines = fact["cve_id"], fact["patch_lines"]
     out = []
-    code = {i for i, line in enumerate(pinned.split_lines(pinned.mask_comments(fact["vuln_func"])[0]
-                                                         if fact["comment_mask_ok"] else fact["vuln_func"]), 1)
-            if pinned.line_key(line)}
+    code = code_lines(fact)
     if not lines or any(not 1 <= n <= fact["n_lines"] for n in lines):
         out.append(f"{cve}: gold lines {lines} outside [1, {fact['n_lines']}]")
     if not set(lines) <= code:

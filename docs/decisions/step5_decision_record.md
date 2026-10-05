@@ -54,21 +54,67 @@ If a run is interrupted, rerun the same command: only unfinished requests are ge
 
 ## Outcome
 
-*To be filled in from `data/frozen_model/step5_report.md`, `audit_report.md`, `rationale_report.md` and the run metas.*
+From `data/frozen_model/step5_report.md`, `audit_report.md`, `rationale_report.md` and the three run metas. The pins were committed at `066d597` (2026-10-02 00:39 UTC) and merged to `main` as `9dc2bf9` (00:49 UTC), with identical `src/` and `tests/`. All three GPU runs ran at clean `9dc2bf9`, the first starting 2026-10-02 09:13 UTC.
 
 | | |
 |---|---|
-| Watermarking in vLLM 0.30.0 | |
-| GRPO caps and bands per type | |
-| distill-self pass / fallback / hint-leak rates per type | |
-| Substituted types; distill-self in the primary test? | |
-| Run (GPUs, timing, determinism recheck, finish reasons) | |
-| sha256s (generations, `distill_self.jsonl`) | |
+| Watermarking in vLLM 0.30.0 | **Settled: no watermark was applied to any output, in step 3 or step 5.** `SamplingParams.watermarking: bool = True` is documented in `vllm/sampling_params.py` line 257 as *"Whether to apply the engine's configured watermark to this request."* It is a per-request switch for a watermark configured on the engine, not a watermark in itself. The engine-level settings in `EngineArgs` default to `watermark = 0.0` and `watermark_config = None` (checked on the GPU machine, vLLM 0.30.0). Neither the probe nor any step-5 run passed either setting: the recorded `llm_kwargs` are only model, revision, tokenizer revision, dtype, seed, `max_model_len` and `generation_config`. So no watermark was configured, and the probe's switch-on had nothing to apply; its outputs are plain greedy decoding. Every step-5 run also set the switch to `False`. Reading `watermark = 0.0` as the strength of an unconfigured watermark is an inference from the default values, not from vLLM documentation. **Pin for later runs:** keep `watermarking=False` per request and pass neither engine setting. |
+| GRPO caps and bands per type | See the audit table below. Two types are banded **dynamic sampling** (MCQ, exact-ID) and three **train as specified** (CVSS, find-the-error, line localisation). **No type is floored.** |
+| distill-self pass / fallback / hint-leak rates per type | See the rationale table below. Of 11,598 targets: 9,308 from attempt 1, 953 recovered by the regeneration, **1,337 gold only (11.5%)**. Every type is in the ≥ 50% band. |
+| Substituted types; distill-self in the primary test? | **None substituted; distill-self stays in the primary test** as the fourth arm (`substitution.json`: `"substituted_types": []`, `"drop_distill_self_from_primary_test": false`). The closest type is line localisation, at 56.5% against the 50% bar. |
+| Run (GPUs, timing, finish reasons) | 4 × NVIDIA A40; vLLM 0.30.0, torch 2.13.0+cu130, transformers 5.17.0, CUDA 13.0, Python 3.13.11; `max_model_len` 17,059. **Audit:** 1,000 requests × 8 = 8,000 rollouts in 840 s (mean 122 output tokens; 7,770 stop / 230 length). **Rationales, attempt 1:** 11,598 in 3,979 s (mean 419 tokens; 9,470 stop / 2,128 length). **Regeneration:** 2,290 in 1,236 s (mean 482 tokens; 1,008 stop / 1,282 length). Engine load 46 s, then 27 s. Re-decoded audit samples match vLLM's text exactly (0 mismatches). |
+| Determinism recheck | **18 of 20** greedy rationale-1 requests produced different text when re-generated in a 20-request batch. The probe gave 2 of 20, but its answers were a few tokens long. A 512-token rationale diverges for good after one batch-dependent floating-point flip. **`rationale_generations.jsonl` is the artifact and cannot be regenerated identically, even greedily.** The audit and regeneration are sampled and have no greedy recheck. |
+| sha256s | Every request, generation and output file is listed in the sha256 table below. |
+
+### GRPO signal audit
+
+| Type | Plan cap | GRPO cap | Cut off at that cap | Parsed | Live groups (dense) | Live groups (binary) | Mean reward | Band |
+|---|---|---|---|---|---|---|---|---|
+| MCQ | 16 | **16** | 2.9% | 93.2% | 25.0% | 25.0% | 0.664 | dynamic sampling |
+| Exact-ID | 24 | **24** | 0.6% | 100.0% | 49.5% | 28.0% | 0.383 | dynamic sampling |
+| CVSS | 48 | **256** | 1.2% | 96.7% | 97.0% | 15.0% | 0.592 | as specified |
+| Find-the-error | 64 | **512** | 0.6% | 99.9% | 69.5% | 66.0% | 0.409 | as specified |
+| Line localisation | 64 | **512** | **13.8%** | 98.8% | 76.0% | 9.0% | 0.184 | as specified |
+
+- **Line localisation's cap is the rule's fallback.** No candidate cap kept the cut-off at or below 10% (64: 99.9%, 128: 97.1%, 256: 62.7%, 512: 13.8%), so the rule gives 512. GRPO trains this column with about one rollout in seven cut off, and a cut-off rollout scores 0 unless its truncated text already parses.
+- **The plan's caps would have been wrong for three types.** At the plan cap, CVSS cuts off 54.7%, find-the-error 99.4% and line localisation 99.9% of rollouts. The base model reasons before answering on these types.
+- **Exact-ID misses "as specified" by one group:** 99 of 200 live, against 100 needed.
+- **MCQ's dead groups are mostly all-correct.** The mean reward is 0.664, and 31% of groups are 8 identical texts at temperature 1.0. CVSS, find-the-error and line localisation have no identical groups, so this is the model's confidence, not a seeding fault.
+- **Find-the-error does not separate the classes.** The model calls 38.1% of vulnerable and 39.8% of patched rollouts vulnerable. Groups are live, but the base model has no class signal to start from. The collapse diagnostics at step 11 matter here.
+- **Line localisation:** predicted set sizes at the 512 cap are mostly 1–4 lines (1,190 of 1,581 parsed); 222 predict 10 or more.
+
+### distill-self rationales
+
+| Type | Items | Valid at attempt 1 | Recovered by regeneration | Gold only | Restates hint (attempt 1) | Substitution |
+|---|---|---|---|---|---|---|
+| MCQ | 1,933 | 1,869 (96.7%) | 39 | 25 (1.3%) | 0.1% | no |
+| Exact-ID | 1,933 | 1,897 (98.1%) | 35 | 1 (0.1%) | 0.5% | no |
+| CVSS | 1,933 | 1,666 (86.2%) | 158 | 109 (5.6%) | 0.9% | no |
+| Find-the-error | 3,866 | 2,783 (72.0%) | 419 | 664 (17.2%) | 0.1% | no |
+| Line localisation | 1,933 | 1,093 (56.5%) | 302 | 538 (27.8%) | 1.1% | no |
+
+- **Almost every failure is a cut-off reply, not wrong reasoning.** At attempt 1, truncation accounts for 1,048 of 1,083 find-the-error failures and 822 of 840 line-localisation failures. Wrong final answers are rare on every type (3–51 per type). These are the two types whose prompts carry the whole function.
+- **Two columns are partly bare gold.** 27.8% of line-localisation and 17.2% of find-the-error distill-self targets carry no reasoning. On those items the arm trains like SFT. Report this beside every distill-self cell in those columns; it is not substitution and is not flagged in the primary test.
+- **The regeneration recovered little where it mattered,** because 56% of its replies were cut off as well (1,282 of 2,290).
+
+### sha256s
+
+| File | sha256 |
+|---|---|
+| `audit_requests.jsonl` | `6005153a…5e8f09f2` |
+| `audit_generations.jsonl` | `2488bdc1…433896d7` |
+| `audit_scores.jsonl` | `22f67c82…03a5a745` |
+| `rationale_requests.jsonl` | `7b75e4b1…5e022a3e` |
+| `rationale_generations.jsonl` | `a9511a46…9991babe` |
+| `rationale_retry_requests.jsonl` | `a4e93520…372f437d` |
+| `rationale_retry_generations.jsonl` | `d4a16298…11241118` |
+| `distill_self.jsonl` | `45b7509d…5633cc87` |
+| `substitution.json` | `d40db52b…18b26d13` |
 
 ## For later steps
 
-- **Step 6.** Generate the external model's rationales for every substituted type, with the same surface-validity rules. Compute the DPO and distill-external lines of the audit. Do not proceed until the audit, substitution decisions and fallback rates are recorded.
-- **Step 11, GRPO.** Use `ROLLOUT_SAMPLING` and the per-type caps recorded above, through TRL's vLLM integration at `VLLM_VERSION`, with watermarking off. Apply dynamic sampling on every type banded "dynamic sampling". Every floored cell is flagged.
+- **Step 6.** No type was substituted, so step 6 generates **no** distill-self substitution rationales. It produces the distill-external traces and the DPO rejected completions, then computes the DPO and distill-external lines of the audit.
+- **Step 11, GRPO.** Use `ROLLOUT_SAMPLING` and the per-type caps recorded above, through TRL's vLLM integration at `VLLM_VERSION`, with watermarking off. Apply dynamic sampling on MCQ and exact-ID, the two types banded "dynamic sampling". No GRPO cell is floored at step 0; the running monitor can still floor one mid-training.
 - **Converters (step 9).** distill-self reads `distill_self.jsonl` by `item_id`. The prompt comes from the bank, and the `target` is the rationale target.
 
 ## Differences from the experiment plan (now reflected in its text)

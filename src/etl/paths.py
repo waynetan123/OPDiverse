@@ -145,5 +145,19 @@ class Paths:
     def frozen_model(self) -> Path:
         return self.data / "frozen_model"
 
+    # Step 6: external-model jobs (file names are in generators.teacher.files)
+    @property
+    def teacher(self) -> Path:
+        return self.data / "teacher"
+
+    @property
+    def teacher_pilot(self) -> Path:
+        return self.teacher / "pilot"
+
+    # Step 7: engine-agreement check (file names are in engine_check.files)
+    @property
+    def engine_check(self) -> Path:
+        return self.data / "engine_check"
+
 
 DEFAULT = Paths(ROOT / "data")

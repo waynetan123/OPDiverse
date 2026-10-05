@@ -154,5 +154,10 @@ class Paths:
     def teacher_pilot(self) -> Path:
         return self.teacher / "pilot"
 
+    # Step 7: engine-agreement check (file names are in engine_check.files)
+    @property
+    def engine_check(self) -> Path:
+        return self.data / "engine_check"
+
 
 DEFAULT = Paths(ROOT / "data")

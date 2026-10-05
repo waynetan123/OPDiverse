@@ -1,8 +1,8 @@
 """Pinned definitions for the OPDiverse fact table, test window, hierarchy scoring, probe, question bank,
-frozen-model session and external-model jobs.
+frozen-model session, external-model jobs, engine-agreement check and primary test.
 
 Everything here can move a census count, a split or a score. It is frozen before step 0: any
-change needs a matching entry in docs/decisions/step{1,...,6}_decision_record.md. Pure functions,
+change needs a matching entry in docs/decisions/step{1,...,7}_decision_record.md. Pure functions,
 stdlib only, no I/O.
 """
 
@@ -323,6 +323,60 @@ DPO_SCHEMAS = {
     }
     for field in ("cwe", "vector", "lines")
 }
+
+# ---------------------------------------------------------------------------
+# Engine agreement (step 7): HuggingFace versus vLLM on the raw backbone
+# ---------------------------------------------------------------------------
+
+# The sample (owner, step 7): the ENGINE_CVES non-test CVEs with the lowest stable_rank(cve_id, ENGINE_SALT)
+# within the late window, all six items each. The late window is the plan's pool for dev: the latest
+# ENGINE_LATE_WINDOW of the non-test pool by (published, cve_id). Greedy EVAL_SAMPLING; test is never read.
+ENGINE_LATE_WINDOW = Fraction(1, 5)
+ENGINE_CVES = 200
+ENGINE_SALT = "engine-agreement"
+# Material disagreement (owner, step 7): on any type, |HF - vLLM| >= ENGINE_GAP and the paired bootstrap
+# interval over CVEs at ENGINE_CI excludes 0. Lenient parsers decide; strict is reported. 99% per type
+# keeps the false-alarm rate over five types near 5% (Bonferroni).
+ENGINE_GAP = Fraction(1, 100)
+ENGINE_CI = Fraction(99, 100)
+ENGINE_BOOTSTRAP = 10_000
+ENGINE_SEED = 0
+# The HF reference: batch size 1 (no padding), EVAL_DTYPE, PyTorch SDPA attention, greedy with every
+# sampling field explicit. Qwen's generation_config would add repetition_penalty 1.05 even under greedy.
+HF_ATTENTION = "sdpa"
+HF_DETERMINISM_CHECK = 5  # requests re-generated per shard
+# Evaluation (step 12) merges each LoRA adapter into the base weights and serves the merged checkpoint
+# through evaluate.run_vllm, the code path this check covers.
+EVAL_LORA = "merged"
+# Parser review: replies shown per (source, type, category) in parser_review.md, by stable_rank.
+PARSER_REVIEW_SAMPLE = 10
+PARSER_REVIEW_SALT = "parser-review"
+
+# ---------------------------------------------------------------------------
+# Primary test and minimum detectable effect (frozen at step 7)
+# ---------------------------------------------------------------------------
+
+# The four primary post-trained arms; the test runs on three if distill-self leaves it (it did not at step 5).
+PRIMARY_ARMS = ("sft", "distill_self", "dpo", "grpo")
+# The null (owner, step 7): a parametric seed bootstrap, replacing the plan's item permutation, which ignores
+# training-run noise. PRIMARY_REPLICATES simulated experiments: additive cell means (no interaction) plus
+# Gaussian run noise at each column's pooled seed SD, the SDs re-estimated in every replicate.
+PRIMARY_REPLICATES = 10_000
+PRIMARY_SEED = 0
+PRIMARY_ALPHA = 0.05
+# T* >= T is read as T* >= T * (1 - PRIMARY_TIE_RTOL), so float summation order cannot break a tie.
+PRIMARY_TIE_RTOL = 1e-12
+# MDE: MDE_SIMULATIONS experiments drawn from the same null (MDE_SEED), with delta points planted in one
+# (arm, type) cell, every arm in turn; power = share with p < PRIMARY_ALPHA against the frozen test's null
+# replicates. MDE = the smallest grid delta from which power stays >= MDE_POWER.
+MDE_SIMULATIONS = 1_000
+MDE_SEED = 1
+MDE_POWER = Fraction(4, 5)
+MDE_GRID_STEP = Fraction(1, 4)  # points
+MDE_GRID_MAX = 50               # points
+# sha256 of src/analysis/{primary_test,mde}.py (analysis.source_sha256). `python -m analysis` refuses to run
+# on any other source; a change needs a new value here and a decision-record entry.
+PRIMARY_TEST_SHA256: str | None = "15e75eb78f5a3ba16f064ae2665bc9b2b0574088d78aebacab456d7df345a207"
 
 # Deprecated CWE-1000 weaknesses -> replacement, read from each entry's Description in the
 # 4.20 XML. A replacement is recorded only where MITRE names exactly one successor; None

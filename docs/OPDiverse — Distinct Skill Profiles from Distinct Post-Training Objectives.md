@@ -98,10 +98,13 @@ For an 800-token function (roughly the fact-table median) generating 8 rollouts 
 |Rollout / audit caps|Per type, the smallest of {MCQ 16 / exact-ID 24 / CVSS 48 / find-the-error 64 / line localisation 64, 128, 256, 512} at which ≤ 10% of audit rollouts are cut off, measured by sampling the audit once at 512 tokens. Stop on end-of-sequence only. Pins in `docs/decisions/step5_decision_record.md`|
 |**Evaluation caps**|**512 tokens, uniform across all arms and types**|
 |External model|Claude Opus 5.5, effort `medium`, for MCQ distractors, DPO negatives, and the distill-self substitution source (distill-external traces: refused, arm dropped at step 6)|
+|Evaluation checkpoints|Each LoRA adapter merged into the base weights, then served by `evaluate.run_vllm`, the runner the step-7 engine check went through|
 
 **Why evaluation caps are uniform and generous.** Tight caps suit GRPO rollouts, where the model is being trained toward terse answers and every arm sees the same cap on the same untrained base — provided the base model's replies fit them. The bank's templates ask for the answer at the end of the reply, which invites reasoning first, so a fixed 16-token cap could cut off every rollout and floor a column for a length setting. The rollout cap per type is therefore set by the audit's cut-off rate under a pre-registered rule (step 5). They are wrong at evaluation, because distill-self is trained to reason before answering. A 24-token evaluation cap would truncate those arms while leaving SFT intact — an efficiency setting that silently penalises specific arms and would be read as an objective effect. Decode is cheap when a model stops early, so a 512 cap costs little and binds only on the arms that must not be truncated.
 
 **Engine-agreement check, before any results exist.** Take one checkpoint, score it on dev under both HuggingFace and vLLM, confirm agreement. Different kernels and floating-point accumulation orders can flip a near-tie under greedy decoding. If the two disagree materially, that must be known before the results exist, not after.
+
+_Pinned at step 7 (`docs/decisions/step7_decision_record.md`)._ No trained checkpoint exists at step 7 and dev is drawn at step 8, so the check runs on the raw backbone, over all six items of 200 CVEs from the late window (the latest 20% of the non-test pool, the plan's pool for dev). Test is never read. vLLM runs twice: pass A in bank order, and pass B in a shuffled order, which measures vLLM's own batch noise. The HF reference runs at batch size 1 with SDPA attention and greedy decoding, from a generation config built from scratch, and every token is asserted to be the argmax of the raw logits. **Material** means that on any type the HF − vLLM A gap is ≥ 1 point and its 99% paired bootstrap interval over CVEs excludes 0 (99% per type keeps the five-type false-alarm rate near 5%). A material result stops the pipeline before step 8.
 
 **Weight-sync assertion.** GRPO's model changes after every optimiser step, so the inference engine's copy goes stale immediately. Weight syncing is handled by TRL's `GRPOTrainer` vLLM integration, not implemented by hand. A runtime assertion confirms rollouts originate from current weights. This is the one failure in the whole integration that produces a _wrong number_ rather than a slow run: if syncing silently fails, GRPO trains against its own past self, reward curves look plausible, and nothing in the results table reveals it.
 
@@ -240,7 +243,7 @@ Literal CWE IDs in a description, and the CVE's own ID anywhere, are redacted. E
 |Find-the-error|2|is this function vulnerable, which CWE|paired accuracy|per-function composite, normalised to [0,1]|
 |Line localisation|1|which lines does the fix touch|F1, one-to-one ±1 matching|same F1, same matcher, parse-gated|
 
-**Item accounting.** Six items per CVE, not five. This propagates: 400 dev CVEs is 2,400 dev items; a 3,400-CVE non-test pool is ~20,400 items per generated artifact; the 150-CVE checkpoint subsample is 900 items; the permutation loop applies one arm-label permutation to all six of a CVE's items. Every count in this document uses six.
+**Item accounting.** Six items per CVE, not five. This propagates: 400 dev CVEs is 2,400 dev items; a 3,400-CVE non-test pool is ~20,400 items per generated artifact; the 150-CVE checkpoint subsample is 900 items. (The primary test's item-level permutation, which applied one arm-label permutation to all six of a CVE's items, was replaced at step 7; see the primary test.) Every count in this document uses six.
 
 **Dense scores.** Reported metric and training score are separate objects. The reported metric never changes. The dense score exists only where an arm consumes a verifier — DPO pair construction and GRPO reward — because binary verifiers produce no gradient at the floor.
 
@@ -281,6 +284,8 @@ Step 3 does real work: without it, a response mentioning CWE-787 contributes 787
 The pinned matcher builds a maximum matching where **each gold line may be claimed by at most one prediction and vice versa**. Among maximum matchings it prefers the most exact hits, then the lowest line numbers. That tie-break decides which pairs are matched, never how many. Matching exact hits first and then greedily at distance 1 is *not* equivalent: gold {11, 12} against prediction {12, 13} scores 0.5 that way and 1.0 under the maximum matching. TP is matched pairs; precision TP/|predicted|, recall TP/|gold|. Under it, `{11, 12, 13}` against `{12}` gives F1 = 0.5 and spray-all returns to 0.095. The identical matcher runs in the GRPO reward and in evaluation.
 
 **All five parsers** are tuned against dev outputs only, never test, and frozen before test is touched. Leniency is worth several points if tuned after seeing results. The same parser runs on every arm, base especially, since base will answer in prose. Every score is also reported under a strict parser as a robustness column; disagreement on arm ordering is a finding about format sensitivity, not a bug.
+
+_Step 7:_ the parsers are reviewed on the untrained backbone's non-test replies (the step-5 audit and the engine check's greedy replies; never the probe's) and frozen before any training, because they also compute the GRPO reward. Any change is approved by the owner and becomes v2, and the probe is re-scored with both versions reported. The outcome is in `docs/decisions/step7_decision_record.md`.
 
 ## Reward shaping
 
@@ -414,7 +419,7 @@ State the configuration count per arm in the paper.
 4. **Generate the question bank, once.** One pass over the whole non-test pool, one pass over the test pool. Six items per CVE. MCQ distractors proposed by the external model and admitted by rule, with the shortcut guard applied. Options frozen, gold letters assigned by CVE-ID hash; report realised per-letter marginals per pool. Freeze the bank.
 5. **Frozen-model vLLM session:** run the GRPO signal audit on non-test items and set the per-type rollout caps (the DPO audit line needs step 6's outputs and is computed there; the distill-external line was never computed, as the arm was dropped); generate distill-self hint-conditioned rationales over the **whole non-test pool**; cache to disk keyed by `(CVE ID, type, item index)`. Evaluate the **substitution trigger** per type and record which types, if any, will draw rationales from the external model.
 6. **External-model jobs:** generate all DPO rejected completions over the whole non-test pool, plus substituted distill-self rationales where triggered (none: step 5 substituted no type). A 20-CVE pilot runs first and prices the full run. distill-external traces were planned here; the pilot's trace requests were all refused, and the arm is dropped. Validate every rejection against its per-type rule; regenerate once, then rule-construct. Cache all outputs; report rule-fallback rates. Do not proceed until the audit, substitution decisions and fallback rates are recorded.
-7. Run the **engine-agreement check** (HF versus vLLM on one checkpoint, dev only). Freeze the primary-test implementation.
+7. Run the **engine-agreement check**: HF versus vLLM on the raw backbone, over 200 late-window non-test CVEs (dev is not drawn until step 8, and no trained checkpoint exists yet). Review and freeze the parsers. Freeze the primary-test and MDE implementation (a seed-bootstrap null; see the primary test).
 8. **For each seed, partition the non-test pool:** late window = latest 20%, draw half at random as dev, rest to train, clusters intact. This is selection over the frozen bank — nothing is regenerated. Report inter-seed dev overlap.
 9. **Run the converters;** produce one training file per arm for this seed by selecting that seed's train items from the frozen bank and the cached artifact files.
 10. **At M1, seed 0 only:** sweep LR over three values per arm on full dev, selecting on the column-standardised mean across types via paired per-item differences. Record the winner per arm.
@@ -633,13 +638,33 @@ p = (1 + #{ T* >= T }) / 10001
 
 One permutation per CVE applied across all six of that CVE's items preserves the within-CVE correlation cluster-level permutation exists to respect — the same test CVE generates every one of them, and shuffling them independently would treat correlated observations as independent and understate the null. The find-the-error pair is inside that cluster, so it inherits the CVE's permutation rather than receiving one of its own. Because main effects are stripped before shuffling, no arm-level advantage can leak into the null.
 
-Frozen at step 7, before any training file is written.
+**Changed at step 7 (owner): the null.** The statistic T above is kept, column scaling included. The item-level permutation is replaced by a **parametric seed bootstrap**.
+
+_Why._ Permuting arms within a test CVE models test-question noise only. Training-run noise is the seed-to-seed shift of an arm's score on a type, and averaging three seeds does not remove it, so it reads as interaction. On simulated M2 data with no interaction at all, at the real size (343 CVEs, four arms, five types, three seeds), the permutation test rejected at p < 0.05:
+- 2 of 40 experiments at 0 points of training noise per cell;
+- 4 of 40 at 1 point;
+- 19 of 40 at 2 points;
+- 40 of 40 at 4 points.
+
+More seeds do not help, because they shrink the noise the shuffle measures as fast as the noise it misses. With 30 seeds it still rejected 10 of 20 at 2 points.
+
+_The replacement._ Under "no interaction", each cell's expected run mean is the additive fit (grand, arm and type effects) to the standardised cell means, times sd_t. Each of 10,000 replicates (seed 0) draws all 60 runs as that mean plus Gaussian noise at the column's pooled seed SD, re-estimates every sd_t, and recomputes T\*. Then p = (1 + #{T\* ≥ T}) / 10,001. In the same simulations it rejected 2, 1, 2 and 3 of 40, and about 5% with a large arm main effect too.
+
+_What it treats as fixed:_ the test CVEs, so the conclusion is about this test set. Run noise is taken as normal, with one SD per column across arms. Both are stated in the write-up.
+
+Frozen at step 7, before any training file is written: `src/analysis/primary_test.py` and `mde.py`, whose sha256 is pinned as `pinned.PRIMARY_TEST_SHA256`.
 
 ### Minimum detectable effect, reported not gated
 
 The earlier plan gated progress on a power simulation requiring 80% power before proceeding. That gate is removed: it depended on a seed-level noise estimate nothing before it produced — the signal audit samples only the frozen base checkpoint and says nothing about how much trained models wobble between seeds — so it ran on a guess, and the guess mattered, since RL seed variance is plausibly several times SFT's.
 
 What remains is the part that answers the reviewer's question. After training, using the pooled seed SDs actually measured: simulate M2 matrices across a range of effect sizes with noise at the observed magnitude; run the frozen primary test on 1,000 matrices per effect size; report the smallest effect detected at 80% power; state that number beside the result, **whatever the result is**.
+
+_Pinned at step 7 (owner): a single-cell effect._
+- Experiments are drawn from the primary test's own null, the additive fit plus seed noise at the measured SDs, 1,000 of them.
+- δ points are planted in one (arm, type) cell, on each arm in turn.
+- Each experiment is read against the frozen test's null replicates.
+- Over a grid of 0–50 points in quarter-point steps, the MDE is the smallest δ from which power stays ≥ 80%. It is reported per type and overall.
 
 No GPU time, no pilot required. A significant result is stronger for carrying it; a null result becomes interpretable — "no interaction detected, and this design detects effects of X points or larger" — rather than uninterpretable.
 

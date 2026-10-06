@@ -50,4 +50,4 @@ From `data/combined_dataset/test_window.md` and `baselines.json`, drawn from `fa
 
 ## Open for step 8
 
-- **The late-window rule gives too little dev.** The plan's "latest 20% of the non-test pool, half to dev" yields ≈ 193 dev CVEs (8.5% of the table), not ≈ 341 (15%). This needs a pin before step 8, e.g. a late window twice the dev size.
+- **The late-window rule gives too little dev.** The plan's "latest 20% of the non-test pool, half to dev" yields ≈ 193 dev CVEs (8.5% of the table), not ≈ 341 (15%). This needs a pin before step 8, e.g. a late window twice the dev size. *Resolved at step 8 (owner):* the late window is 684 CVEs, twice the dev target. See `step8_decision_record.md`.

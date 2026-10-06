@@ -130,7 +130,7 @@ An efficiency change applied to some arms and not others is a confound. Everythi
 - **One training job per GPU.** A 7B with LoRA fits on a single A40. Sharding across four cards with FSDP or ZeRO-3 gains nothing and costs 30–50% to PCIe communication on hardware without NVLink. The workload is 120 embarrassingly parallel runs; run four at once.
 - **Flash Attention 2** everywhere (Ampere is supported).
 - **Gradient checkpointing off** unless memory measurement says otherwise. It trades ~30% more compute for memory you likely do not need.
-- **Sequence packing** for the cross-entropy arms (base, SFT, distill-self), with attention masking so no sequence attends across a document boundary. Structurally inapplicable to DPO (paired) and GRPO (per-prompt groups); recorded in the per-arm config rather than treated as an oversight.
+- **Sequence packing** for the cross-entropy arms (base, SFT, distill-self), with attention masking so no sequence attends across a document boundary. Structurally inapplicable to DPO (paired) and GRPO (per-prompt groups); recorded in the per-arm config rather than treated as an oversight. _Pinned at step 10:_ padding-free batching within a step (no padding, no attention across documents) instead of cross-example packing, so every arm's optimizer step holds the same 24 rows.
 - **Length bucketing** for DPO and GRPO, recovering most of what packing would have.
 - **LoRA rank 16** on attention and MLP projections, identical across all arms.
 
@@ -206,7 +206,7 @@ At 4000 CVEs: 3000 / 400 / 600. At 2500: 1875 / 250 / 375. **Fallback:** below 2
 
 **No absolute dev floor.** The earlier 500-CVE minimum counted the wrong unit: each dev CVE contributes **six** question items, so 400 CVEs is 2,400 dev items. Correlation within a CVE puts the effective n below 2,400 but far above 400. The floor was also unsatisfiable — 10% never reaches 500 in the stated census range — so it silently overrode the split it accompanied. Three conditions replace it:
 
-1. **Selection on the mean across question types, never per type.** Per type the count really is 250–400 (800 for find-the-error) and the precision worry bites; across types it does not. Column-standardised, using the same pooled seed SD as the primary test.
+1. **Selection on the mean across question types, never per type.** Per type the count really is 250–400 (800 for find-the-error) and the precision worry bites; across types it does not. Column-standardised, using the same pooled seed SD as the primary test. _Changed at step 10 (owner):_ that SD needs several seeds and does not exist at seed 0, so each type is divided by its **per-CVE spread** (the SD over CVEs of the per-CVE score, pooled over the sweep's checkpoint evaluations), frozen before any choice and reused for checkpoint selection at steps 11 and 15.
 2. **Paired comparisons.** Candidates are scored on identical items, so what matters is precision of the _difference_, which depends only on items where candidates disagree. At 10% disagreement over 2,400 items, SE of the difference ≈ 0.65 points — well below the 2-point gaps being resolved.
 3. **A small grid.** Three learning rates; four checkpoints.
 
@@ -416,6 +416,12 @@ State the configuration count per arm in the paper.
 
 **Sweep once, reuse everywhere.** The sweep runs at **M1, seed 0 only**, on **full dev** — this is the comparison that most needs precision and it happens once. The winning LR per arm is reused for every seed, every M2 loop, and M1-volume.
 
+_Pinned at step 10 (`docs/decisions/step10_decision_record.md`):_
+- **The grid** is {1e-5, 5e-5, 2e-4} for every arm (owner). It is not extended if a winner lands on an edge; edges are flagged.
+- **Per run**, the checkpoint is chosen on the 150-CVE subsample. **Per arm**, the LR is chosen on full dev at each run's chosen checkpoint. Ties go to the earlier checkpoint and the lower LR.
+- **Run length** (one or three passes over the file, the published default being three) is pinned by the owner from a costing pilot's measured GPU-hours, before any sweep run.
+- **The seed-0 winners** are also M1's seed-0 keepers (owner).
+
 **Checkpoint selection per run, reduced.** Four checkpoints, evaluated on a **fixed 150-CVE dev subsample (900 items)**, the same subsample across all runs within a seed so comparisons stay paired. Pin the subsample before training. _Pinned at step 8:_ per seed, the 150 dev CVEs with the lowest `stable_rank(cve_id, "checkpoint-subsample", seed)`. As originally specified (10 checkpoints × 2,400 items × 120 runs) selection would have required 2.88 million generations — larger than it appears and entirely absent from the budget; the reduction brings it to ~432k. Four evenly spaced checkpoints is enough to catch the peak on a fine-tuning curve this short.
 
 **The trade-off, stated.** The shared LR was chosen on a seed-0 dev set containing all five types, so every M2 run inherits a trace of exposure to its dropped type. That channel is one scalar informing five columns, far weaker than the gradient exposure M2 removes and weaker than per-run checkpoint selection, which stays clean. It is not zero, and the write-up says so.
@@ -431,7 +437,7 @@ State the configuration count per arm in the paper.
 7. Run the **engine-agreement check**: HF versus vLLM on the raw backbone, over 200 late-window non-test CVEs (dev is not drawn until step 8, and no trained checkpoint exists yet). Review and freeze the parsers. Freeze the primary-test and MDE implementation (a seed-bootstrap null; see the primary test).
 8. **For each seed, partition the non-test pool:** late window = the latest 684 CVEs (2 × the dev target; see Splits), draw half at random as dev, rest to train, clusters intact. This is selection over the frozen bank — nothing is regenerated. Report inter-seed dev overlap. _Done for seeds 0–4._
 9. **Run the converters;** produce one training file per arm for this seed by selecting that seed's train items from the frozen bank and the cached artifact files. _Done at step 9 for every configuration at once_ (M1, the five M2 masks and both M1-volume masks, seeds 0–4), so steps 14 and 18 read frozen files. See `docs/decisions/step9_decision_record.md`.
-10. **At M1, seed 0 only:** sweep LR over three values per arm on full dev, selecting on the column-standardised mean across types via paired per-item differences. Record the winner per arm.
+10. **At M1, seed 0 only:** sweep LR over three values per arm on full dev, selecting on the column-standardised mean across types via paired per-item differences. Record the winner per arm. _Pre-registered at step 10:_ grid {1e-5, 5e-5, 2e-4}; each type standardised by its per-CVE spread; a costing pilot first; the winners are the M1 seed-0 keepers. See `docs/decisions/step10_decision_record.md`.
 11. **Train the arms**, three seeds, one job per GPU, recorded LRs. Select checkpoints per run on the fixed 150-CVE dev subsample.
 12. **Evaluate** every model on the whole frozen test set via vLLM, 512-token cap, all five types, every run.
 13. **Record M1.**
@@ -474,16 +480,17 @@ The old version differs from M2 along an axis M2 never moved (total example coun
 |Component|Count|
 |---|---|
 |LR sweep: 6 arms × 3 LRs, M1 seed 0 only|18|
-|M1 keepers: 5 primary arms × 3 seeds|15|
+|M1 keepers: 5 primary arms × 3 seeds, seed 0 being the sweep winners (step 10)|15 − 5 = 10|
 |M2 keepers: 4 post-trained arms × 5 types × 3 seeds|60|
 |Base noise floor: one leave-one-out config × 3 fresh seeds|3|
 |M1-volume: 4 post-trained arms × 2 shares (1/6, 1/3) × 3 seeds|24|
-|Secondary at M1: SFT→DPO × 3 seeds|3|
-|**Required total**|**123**|
+|Secondary at M1: SFT→DPO × 3 seeds, seed 0 being the sweep winner (step 10)|3 − 1 = 2|
+|**Required total**|**117**|
 
 The base arm's M2 equals its M1 by construction and is not re-run beyond the noise-floor configuration. Had substitution fired on three or more types, distill-self would have left the primary test; step 5 kept it, so that case does not arise. Base has nothing to mask, so it has no M1-volume run. Earlier totals:
 - 120 with distill-external, which was dropped at step 6 (3 sweep runs and 3 secondary runs);
-- 114 before step 9 split M1-volume into two shares.
+- 114 before step 9 split M1-volume into two shares;
+- 123 before step 10 reused the six seed-0 sweep winners as M1's seed-0 keepers.
 
 **GPU-hours, with the vLLM integration and reduced selection:**
 

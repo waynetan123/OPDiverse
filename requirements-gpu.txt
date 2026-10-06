@@ -1,3 +1,11 @@
 # GPU machine only, for `python -m probe.run_vllm` (and later all evaluation).
 # Record the installed version in run_meta.json; it becomes pinned.VLLM_VERSION for every later evaluation.
 vllm
+# Training (step 10 on: `python -m train.run`, `python -m train.merge`). The pilot records the installed versions in
+# its run_meta.json; they become pinned.TRAIN_LIBS, and every sweep run refuses any other.
+trl
+peft
+accelerate
+datasets
+liger-kernel
+flash-attn

@@ -1,8 +1,9 @@
 """Pinned definitions for the OPDiverse fact table, test window, hierarchy scoring, probe, question bank,
-frozen-model session, external-model jobs, engine-agreement check and primary test.
+frozen-model session, external-model jobs, engine-agreement check, primary test, seed partitions and
+converters.
 
 Everything here can move a census count, a split or a score. It is frozen before step 0: any
-change needs a matching entry in docs/decisions/step{1,...,7}_decision_record.md. Pure functions,
+change needs a matching entry in docs/decisions/step{1,...,9}_decision_record.md. Pure functions,
 stdlib only, no I/O.
 """
 
@@ -61,6 +62,35 @@ DEV_SALT = "dev-partition"
 # The fixed checkpoint-selection subsample: CHECKPOINT_CVES dev CVEs per seed, all six items each.
 CHECKPOINT_CVES = 150
 CHECKPOINT_SALT = "checkpoint-subsample"
+
+# ---------------------------------------------------------------------------
+# Converters (step 9)
+# ---------------------------------------------------------------------------
+
+# One training file per arm, per matrix configuration, per seed: a selection over the frozen bank and the cached
+# step-5 and step-6 files. SFT->DPO trains on the dpo file of the same configuration and seed (it differs from
+# DPO-from-base only in initialisation); distill-external was dropped at step 6.
+CONVERTER_ARMS = ("base", "sft", "distill_self", "dpo", "grpo")
+QUESTION_ARMS = ("sft", "distill_self", "dpo", "grpo")  # base has no question items, so it is built for M1 only
+SFT_DPO_READS = "dpo"
+# M2 drops one type from train (and from dev at checkpoint selection) and upsamples the rest back to M1's row
+# count. M1-volume drops the same share of items uniformly at random, redrawn per seed, then upsamples the same
+# way. The share is 1/6 for the one-item types and 1/3 for find_error, which has two of a CVE's six items
+# (owner, step 9; the plan's 20% matched no M2 loop).
+M1V_FRACTIONS = (Fraction(1, 6), Fraction(1, 3))
+CONVERTER_SALTS = {"mask": "m1v-mask", "upsample": "upsample", "order": "order"}
+# Completions end in the token evaluation stops on; base documents end in Qwen's end-of-document token.
+COMPLETION_END = "<|im_end|>"
+BASE_DOC_END = "<|endoftext|>"
+# The base arm's raw text (owner, step 9): the facts every other arm trains on, with no question and no answer
+# format. The description and functions are the redacted strings the prompts show; the CWE name is MITRE's.
+BASE_DOC_TEMPLATE = (
+    "A vulnerability is described as follows:\n\n{description}\n\n"
+    "Weakness: {cwe}: {name}\n"
+    "CVSS v3 base vector: {vector}\n\n"
+    "Vulnerable function:\n\n```c\n{vulnerable}\n```\n\n"
+    "Patched function:\n\n```c\n{patched}\n```"
+)
 
 # ---------------------------------------------------------------------------
 # Exact-ID hierarchy credit (step 2)

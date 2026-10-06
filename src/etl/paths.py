@@ -172,5 +172,10 @@ class Paths:
     def engine_check(self) -> Path:
         return self.data / "engine_check"
 
+    # Step 9: converters (file names are in converters.files)
+    @property
+    def converters(self) -> Path:
+        return self.data / "converters"
+
 
 DEFAULT = Paths(ROOT / "data")

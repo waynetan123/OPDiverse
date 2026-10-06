@@ -97,7 +97,7 @@ Its outputs never enter selection and go to `data/sweep/pilot/`. It records:
 1. Commit the code, the pins, this record and the plan-document edits.
 2. `PYTHONPATH=src python -m sweep prepare`. Already written; the rerun is byte-identical: `dev_requests.jsonl` `e27e5f9b…39a85082`, `checkpoint_requests.jsonl` `afe19ded…667b3944`.
 3. On the GPU machine, at that commit:
-   - `pip install -r requirements-gpu.txt`;
+   - `pip install -r requirements-gpu.txt`, holding the installed torch, transformers and vLLM where they are (a constraints file of their `pip freeze` lines), then `pip install flash-attn --no-build-isolation`, since its build imports torch;
    - copy `data/` over: `bank/`, `combined_dataset/`, `converters/`, `mitre_cwe/`, `sweep/*_requests.jsonl`.
 4. **Pilot**, for each arm A in base, sft, distill_self, dpo and grpo:
    - `python -m train.run --arm A --lr 5e-5 --pilot --max-steps 8 --longest-first --gradient-checkpointing off --check-only`, then without `--check-only`;

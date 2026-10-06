@@ -104,7 +104,7 @@ For an 800-token function (roughly the fact-table median) generating 8 rollouts 
 
 **Engine-agreement check, before any results exist.** Take one checkpoint, score it on dev under both HuggingFace and vLLM, confirm agreement. Different kernels and floating-point accumulation orders can flip a near-tie under greedy decoding. If the two disagree materially, that must be known before the results exist, not after.
 
-_Pinned at step 7 (`docs/decisions/step7_decision_record.md`)._ No trained checkpoint exists at step 7 and dev is drawn at step 8, so the check runs on the raw backbone, over all six items of 200 CVEs from the late window (the latest 20% of the non-test pool, the plan's pool for dev). Test is never read. vLLM runs twice: pass A in bank order, and pass B in a shuffled order, which measures vLLM's own batch noise. The HF reference runs at batch size 1 with SDPA attention and greedy decoding, from a generation config built from scratch, and every token is asserted to be the argmax of the raw logits. **Material** means that on any type the HF − vLLM A gap is ≥ 1 point and its 99% paired bootstrap interval over CVEs excludes 0 (99% per type keeps the five-type false-alarm rate near 5%). A material result stops the pipeline before step 8.
+_Pinned at step 7 (`docs/decisions/step7_decision_record.md`); outcome: **agree** on every type, under parsers v1 and v2._ No trained checkpoint exists at step 7 and dev is drawn at step 8, so the check runs on the raw backbone, over all six items of 200 CVEs from the late window (the latest 20% of the non-test pool, the plan's pool for dev). Test is never read. vLLM runs twice: pass A in bank order, and pass B in a shuffled order, which measures vLLM's own batch noise. The HF reference runs at batch size 1 with SDPA attention and greedy decoding, from a generation config built from scratch, and every token is asserted to be the argmax of the raw logits. **Material** means that on any type the HF − vLLM A gap is ≥ 1 point and its 99% paired bootstrap interval over CVEs excludes 0 (99% per type keeps the five-type false-alarm rate near 5%). A material result stops the pipeline before step 8.
 
 **Weight-sync assertion.** GRPO's model changes after every optimiser step, so the inference engine's copy goes stale immediately. Weight syncing is handled by TRL's `GRPOTrainer` vLLM integration, not implemented by hand. A runtime assertion confirms rollouts originate from current weights. This is the one failure in the whole integration that produces a _wrong number_ rather than a slow run: if syncing silently fails, GRPO trains against its own past self, reward curves look plausible, and nothing in the results table reveals it.
 
@@ -285,7 +285,12 @@ The pinned matcher builds a maximum matching where **each gold line may be claim
 
 **All five parsers** are tuned against dev outputs only, never test, and frozen before test is touched. Leniency is worth several points if tuned after seeing results. The same parser runs on every arm, base especially, since base will answer in prose. Every score is also reported under a strict parser as a robustness column; disagreement on arm ordering is a finding about format sensitivity, not a bug.
 
-_Step 7:_ the parsers are reviewed on the untrained backbone's non-test replies (the step-5 audit and the engine check's greedy replies; never the probe's) and frozen before any training, because they also compute the GRPO reward. Any change is approved by the owner and becomes v2, and the probe is re-scored with both versions reported. The outcome is in `docs/decisions/step7_decision_record.md`.
+_Step 7:_ the parsers are reviewed on the untrained backbone's non-test replies (the step-5 audit and the engine check's greedy replies; never the probe's) and frozen before any training, because they also compute the GRPO reward. Any change is approved by the owner and becomes v2, and the probe is re-scored with both versions reported. _Outcome:_ **parsers v2**, frozen. Three owner-approved changes:
+- an MCQ answer written as one option's text reads as that option's letter;
+- CVSS accepts the specification's value names (`AV:Network`);
+- without a `LINES:` field, echoed code is not read as predicted lines.
+
+The probe re-scores identically, and step 5's decisions stand. Details are in `docs/decisions/step7_decision_record.md`.
 
 ## Reward shaping
 

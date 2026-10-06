@@ -317,7 +317,7 @@ The prompt is byte-identical across all arms. Only what sits beside it changes. 
 
 |Arm|Role|Consumes|Per-item form|
 |---|---|---|---|
-|Base|primary|raw text|no question items at all|
+|Base|primary|raw text|no question items at all: one plain document per train CVE carrying its facts (step 9)|
 |SFT|primary|prompt + gold|prompt → gold string|
 |Distill-self|primary|prompt + own hint-conditioned rationales|base model writes a rationale _given the gold answer_; rationale + gold answer is the target|
 |DPO-from-base|primary|prompt + chosen/rejected|chosen is gold; rejected written by the external model in identical format|
@@ -393,7 +393,9 @@ _Outcome (step 6, `docs/decisions/step6_decision_record.md`):_ `dpo.jsonl` built
 
 ### Base arm definition
 
-Base is continued pretraining on raw text, with the same LoRA config and optimizer steps as the other arms. It is not a zero-shot control. The distinction governs how the base reference line in M2 is read.
+Base is continued pretraining on raw text, with the same LoRA config and optimizer steps as the other arms. It is not a zero-shot control.
+
+_Pinned at step 9 (owner):_ the raw text is one plain document per train CVE, holding the same facts every other arm trains on and no question or answer format. It contains the description as the prompts show it, the CWE ID and MITRE name, the CVSS vector, and the vulnerable and patched functions, and it ends in `<|endoftext|>`. It has no chat template and no CVE ID. The template is `pinned.BASE_DOC_TEMPLATE`. The distinction governs how the base reference line in M2 is read.
 
 ## Tuning parity and hyperparameters
 
@@ -428,7 +430,7 @@ State the configuration count per arm in the paper.
 6. **External-model jobs:** generate all DPO rejected completions over the whole non-test pool, plus substituted distill-self rationales where triggered (none: step 5 substituted no type). A 20-CVE pilot runs first and prices the full run. distill-external traces were planned here; the pilot's trace requests were all refused, and the arm is dropped. Validate every rejection against its per-type rule; regenerate once, then rule-construct. Cache all outputs; report rule-fallback rates. Do not proceed until the audit, substitution decisions and fallback rates are recorded.
 7. Run the **engine-agreement check**: HF versus vLLM on the raw backbone, over 200 late-window non-test CVEs (dev is not drawn until step 8, and no trained checkpoint exists yet). Review and freeze the parsers. Freeze the primary-test and MDE implementation (a seed-bootstrap null; see the primary test).
 8. **For each seed, partition the non-test pool:** late window = the latest 684 CVEs (2 × the dev target; see Splits), draw half at random as dev, rest to train, clusters intact. This is selection over the frozen bank — nothing is regenerated. Report inter-seed dev overlap. _Done for seeds 0–4._
-9. **Run the converters;** produce one training file per arm for this seed by selecting that seed's train items from the frozen bank and the cached artifact files.
+9. **Run the converters;** produce one training file per arm for this seed by selecting that seed's train items from the frozen bank and the cached artifact files. _Done at step 9 for every configuration at once_ (M1, the five M2 masks and both M1-volume masks, seeds 0–4), so steps 14 and 18 read frozen files. See `docs/decisions/step9_decision_record.md`.
 10. **At M1, seed 0 only:** sweep LR over three values per arm on full dev, selecting on the column-standardised mean across types via paired per-item differences. Record the winner per arm.
 11. **Train the arms**, three seeds, one job per GPU, recorded LRs. Select checkpoints per run on the fixed 150-CVE dev subsample.
 12. **Evaluate** every model on the whole frozen test set via vLLM, 512-token cap, all five types, every run.
@@ -444,9 +446,15 @@ State the configuration count per arm in the paper.
 
 **Why dev drops the type too.** Dev produces no gradients but produces selection. Checkpoints are chosen by dev score, so leaving type X in dev means selecting the checkpoint that does best at the type the arm is claimed never to have seen. That biases M2 upward, flattering the headline. Test keeps type X because scoring the removed type _is_ M2.
 
-**Upsampling and its control.** Without upsampling, M2 trains on 20% less data than M1. With it, M2 differs from M1 in two ways at once: never saw type X, and saw the other four with duplication. M1-volume isolates the second.
+**Upsampling and its control.** Without upsampling, M2 trains on 1/6 less data than M1 (1/3 when find-the-error, two of a CVE's six items, is dropped). With it, M2 differs from M1 in two ways at once: never saw type X, and saw the other four with duplication. M1-volume isolates the second.
 
-**M1-volume, corrected.** Same procedure as M2, with the removal spread across all five types: mask 20% of items uniformly at random, then upsample survivors back to full count with matched steps.
+**M1-volume, corrected.** Same procedure as M2, with the removal spread across all five types: mask a share of items uniformly at random, then upsample survivors back to full count with matched steps.
+
+_Changed at step 9 (owner): two shares, not 20%._ A CVE has six items, so dropping one type removes 1/6 of them, or 1/3 for find-the-error, and 20% matches no M2 loop. M1-volume therefore runs at both shares:
+- `m1v-1of6` is the comparator for the M2 loops on MCQ, exact-ID, CVSS and line localisation;
+- `m1v-1of3` is the comparator for find-the-error.
+
+Each M2 loop is compared with a run that removes exactly as many items and duplicates exactly as many. The table below keeps the plan's illustrative 20%.
 
 |Config|Total examples|Distinct|Steps|
 |---|---|---|---|
@@ -469,11 +477,13 @@ The old version differs from M2 along an axis M2 never moved (total example coun
 |M1 keepers: 5 primary arms × 3 seeds|15|
 |M2 keepers: 4 post-trained arms × 5 types × 3 seeds|60|
 |Base noise floor: one leave-one-out config × 3 fresh seeds|3|
-|M1-volume: × 3 seeds|15|
+|M1-volume: 4 post-trained arms × 2 shares (1/6, 1/3) × 3 seeds|24|
 |Secondary at M1: SFT→DPO × 3 seeds|3|
-|**Required total**|**114**|
+|**Required total**|**123**|
 
-The base arm's M2 equals its M1 by construction and is not re-run beyond the noise-floor configuration. If substitution fires on three or more types and distill-self is dropped from the primary test, M2 falls to 45 and the total to 99. (The total was 120 with distill-external, dropped at step 6: 3 sweep runs and 3 secondary runs.)
+The base arm's M2 equals its M1 by construction and is not re-run beyond the noise-floor configuration. Had substitution fired on three or more types, distill-self would have left the primary test; step 5 kept it, so that case does not arise. Base has nothing to mask, so it has no M1-volume run. Earlier totals:
+- 120 with distill-external, which was dropped at step 6 (3 sweep runs and 3 secondary runs);
+- 114 before step 9 split M1-volume into two shares.
 
 **GPU-hours, with the vLLM integration and reduced selection:**
 
@@ -585,7 +595,7 @@ Note what the frozen bank does and does not remove from seed variance: item _con
 
 **M1** — all arms trained on all five types, tested on held-out items.
 
-**M1-volume** — 20% of examples masked uniformly across types, survivors upsampled to full count and matched steps. The comparator for M2.
+**M1-volume** — 1/6 or 1/3 of examples masked uniformly across types (matching the M2 loop it is compared with), survivors upsampled to full count and matched steps. The comparator for M2.
 
 **M2** — for each type in turn, retrain the four primary post-trained arms with that type masked out of train and dev and the rest upsampled. Test on the removed type. Five loops, five columns.
 

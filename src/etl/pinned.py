@@ -48,6 +48,21 @@ NEAR_DUP_JACCARD = Fraction(4, 5)
 SHINGLE_N = 3
 
 # ---------------------------------------------------------------------------
+# Seed partitions (step 8)
+# ---------------------------------------------------------------------------
+
+# Owner, step 8: partitions are drawn for five seeds; step 11 decides whether seeds 3-4 are trained.
+PARTITION_SEEDS = (0, 1, 2, 3, 4)
+# The late window holds LATE_WINDOW_MULTIPLE x the dev target, ceil(DEV_FRACTION x all facts), so that a
+# random half of it gives the 70/15/15 fallback's dev (owner, step 8; the plan's 20% gave ~193 dev CVEs).
+DEV_FRACTION = Fraction(3, 20)
+LATE_WINDOW_MULTIPLE = 2
+DEV_SALT = "dev-partition"
+# The fixed checkpoint-selection subsample: CHECKPOINT_CVES dev CVEs per seed, all six items each.
+CHECKPOINT_CVES = 150
+CHECKPOINT_SALT = "checkpoint-subsample"
+
+# ---------------------------------------------------------------------------
 # Exact-ID hierarchy credit (step 2)
 # ---------------------------------------------------------------------------
 

@@ -93,6 +93,19 @@ class Paths:
     def baselines_json(self) -> Path:
         return self.out / "baselines.json"
 
+    # Step 8
+    @property
+    def partition(self) -> Path:
+        return self.out / "partition.jsonl"
+
+    @property
+    def partition_json(self) -> Path:
+        return self.out / "partition.json"
+
+    @property
+    def partition_md(self) -> Path:
+        return self.out / "partition.md"
+
     # Step 3: contamination probe
     @property
     def probe(self) -> Path:

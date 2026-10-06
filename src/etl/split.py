@@ -157,6 +157,138 @@ def _check(facts: list[dict], assignments: list[dict], boundary: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Seed partitions (step 8)
+# ---------------------------------------------------------------------------
+
+
+def partition(facts: list[dict], assignments: list[dict]) -> dict:
+    """Per seed, a random half of the non-test late window (whole clusters) is dev; the rest of non-test
+    is train. A cluster straddling the window's boundary day goes wholly to the earlier side, as in step 2."""
+    pool_of = {a["cve_id"]: a["pool"] for a in assignments}
+    cluster_of = {a["cve_id"]: a["cluster_id"] for a in assignments}
+    nontest = sorted((r["published"], r["cve_id"]) for r in facts if pool_of[r["cve_id"]] == "nontest")
+    w = pinned.LATE_WINDOW_MULTIPLE * math.ceil(len(facts) * pinned.DEV_FRACTION)
+    boundary = nontest[len(nontest) - w][0][:10]
+    initial = {cve for pub, cve in nontest if pub[:10] >= boundary}
+    members: dict[str, list[str]] = {}
+    for _, cve in nontest:
+        members.setdefault(cluster_of[cve], []).append(cve)
+    moved = sorted(c for group in members.values() if 0 < sum(c in initial for c in group) < len(group)
+                   for c in group if c in initial)
+    window = initial - set(moved)
+    target = math.ceil(len(window) / 2)
+
+    dev, checkpoint = {}, {}
+    for seed in pinned.PARTITION_SEEDS:
+        chosen: set[str] = set()
+        for cid in sorted({cluster_of[c] for c in window}, key=lambda c: (pinned.stable_rank(c, pinned.DEV_SALT, str(seed)), c)):
+            if len(chosen) >= target:
+                break
+            chosen.update(members[cid])
+        if len(chosen) < pinned.CHECKPOINT_CVES:
+            raise SystemExit(f"seed {seed}: dev has {len(chosen)} CVEs, fewer than the {pinned.CHECKPOINT_CVES}-CVE checkpoint subsample")
+        dev[seed] = chosen
+        ranked = sorted(chosen, key=lambda c: (pinned.stable_rank(c, pinned.CHECKPOINT_SALT, str(seed)), c))
+        checkpoint[seed] = set(ranked[: pinned.CHECKPOINT_CVES])
+
+    for seed in pinned.PARTITION_SEEDS:
+        assert all(len({c in dev[seed] for c in group}) == 1 for group in members.values()), "a cluster spans train and dev"
+        assert dev[seed] <= window and checkpoint[seed] <= dev[seed]
+    assert len({frozenset(d) for d in dev.values()}) == len(dev), "two seeds drew the same dev set"
+
+    rows = [{
+        "cve_id": cve,
+        "cluster_id": cluster_of[cve],
+        "late_window": cve in window,
+        "moved_out_of_window": cve in moved,
+        "role": {str(s): "dev" if cve in dev[s] else "train" for s in pinned.PARTITION_SEEDS},
+        "checkpoint_seeds": [s for s in pinned.PARTITION_SEEDS if cve in checkpoint[s]],
+    } for _, cve in nontest]
+    return {
+        "n_facts": len(facts),
+        "n_nontest": len(nontest),
+        "window_target": w,
+        "boundary_day": boundary,
+        "on_or_after_boundary": len(initial),
+        "moved": moved,
+        "window": len(window),
+        "dev_target": target,
+        "rows": rows,
+    }
+
+
+def partition_stats(facts: list[dict], rows: list[dict]) -> dict:
+    """Per seed and role (train, dev, checkpoint): size, dates, CVSS versions, CWEs and MCQ gold letters;
+    and the pairwise dev overlap between seeds."""
+    by_cve = {r["cve_id"]: r for r in facts}
+    seeds = [str(s) for s in pinned.PARTITION_SEEDS]
+    letter = lambda cve: pinned.MCQ_LETTERS[pinned.stable_rank(cve, pinned.MCQ_SALTS["letter"]) % 4]  # noqa: E731
+    out: dict = {"seeds": {}, "dev_overlap": {}}
+    for s in seeds:
+        groups = {
+            "train": [r["cve_id"] for r in rows if r["role"][s] == "train"],
+            "dev": [r["cve_id"] for r in rows if r["role"][s] == "dev"],
+            "checkpoint": [r["cve_id"] for r in rows if int(s) in r["checkpoint_seeds"]],
+        }
+        train_cwes = {by_cve[c]["cwe"] for c in groups["train"]}
+        out["seeds"][s] = {}
+        for role, cves in groups.items():
+            facts_ = [by_cve[c] for c in cves]
+            cwes = Counter(f["cwe"] for f in facts_)
+            out["seeds"][s][role] = {
+                "cves": len(cves),
+                "items": len(cves) * pinned.ITEMS_PER_CVE,
+                "published_min": min(f["published"] for f in facts_),
+                "published_max": max(f["published"] for f in facts_),
+                "cvss_versions": dict(sorted(Counter(f["cvss_version"] for f in facts_).items())),
+                "distinct_cwes": len(cwes),
+                "top_cwes": [[c, n] for c, n in sorted(cwes.items(), key=lambda kv: (-kv[1], int(kv[0][4:])))[:3]],
+                "mcq_letters": {x: sum(letter(c) == x for c in cves) for x in pinned.MCQ_LETTERS},
+                "cves_with_cwe_unseen_in_train": sum(f["cwe"] not in train_cwes for f in facts_),
+            }
+    devs = {s: {r["cve_id"] for r in rows if r["role"][s] == "dev"} for s in seeds}
+    for i, a in enumerate(seeds):
+        for b in seeds[i + 1:]:
+            out["dev_overlap"][f"{a}-{b}"] = {"shared": len(devs[a] & devs[b]),
+                                             "jaccard": round(len(devs[a] & devs[b]) / len(devs[a] | devs[b]), 4)}
+    return out
+
+
+def render_partition_markdown(part: dict, stats: dict) -> str:
+    out = [
+        "# Step 8: seed partitions", "",
+        f"Drawn from `facts.jsonl` sha256 `{part['facts_sha256']}` and `split.jsonl` sha256 `{part['split_sha256']}`.", "",
+        f"- **Late window:** {pinned.LATE_WINDOW_MULTIPLE} × ⌈{pinned.DEV_FRACTION} × {part['n_facts']:,}⌉ = {part['window_target']:,} "
+        f"of the {part['n_nontest']:,} non-test CVEs. Boundary day **{part['boundary_day']}**; "
+        f"{part['on_or_after_boundary']:,} CVEs fall on or after it.",
+        f"- **Moved out of the window** (near-duplicate clusters straddling the boundary, sent wholly to train): "
+        f"{len(part['moved'])}" + (f" ({', '.join(part['moved'])})" if part["moved"] else "") + ".",
+        f"- **Window: {part['window']:,} CVEs.** Per seed, whole clusters are drawn until dev holds ≥ {part['dev_target']:,}; "
+        f"the rest of non-test is train. The checkpoint subsample is {pinned.CHECKPOINT_CVES} dev CVEs per seed.",
+        "",
+        "## Per seed", "",
+    ]
+    rows = []
+    for s, roles in stats["seeds"].items():
+        for role, x in roles.items():
+            rows.append((
+                s, role, f"{x['cves']:,}", f"{x['items']:,}",
+                f"{x['published_min'][:10]} → {x['published_max'][:10]}",
+                f"{x['cvss_versions'].get('3.0', 0):,} / {x['cvss_versions'].get('3.1', 0):,}",
+                x["distinct_cwes"], ", ".join(f"{c} ({n})" for c, n in x["top_cwes"]),
+                " / ".join(str(x["mcq_letters"][k]) for k in pinned.MCQ_LETTERS),
+                "" if role == "train" else x["cves_with_cwe_unseen_in_train"],
+            ))
+    out += [_table(("Seed", "Role", "CVEs", "Items", "Published", "CVSS v3.0 / v3.1", "CWEs", "Top CWEs",
+                    "MCQ A / B / C / D", "CVEs with a CWE unseen in train"), rows), ""]
+    out += ["## Dev overlap between seeds", "",
+            "A random half of the window is expected to share about half its CVEs with another seed's.", "",
+            _table(("Seeds", "Shared dev CVEs", "Jaccard"),
+                   ((k, v["shared"], f"{v['jaccard']:.3f}") for k, v in stats["dev_overlap"].items())), ""]
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
 # Per-pool description
 # ---------------------------------------------------------------------------
 

@@ -1,4 +1,4 @@
-"""Steps 1-2: build the fact table, then draw the frozen test window.
+"""Steps 1-2 and 8: build the fact table, draw the frozen test window, then the per-seed partitions.
 
     PYTHONPATH=src python -m etl.build extract-nvd    # yearly NVD feeds -> data/cache/nvd_subset.jsonl.gz
     PYTHONPATH=src python -m etl.build build          # -> facts / candidates / drops / census.json
@@ -7,8 +7,9 @@
     PYTHONPATH=src python -m etl.build check          # invariants over facts.jsonl
     PYTHONPATH=src python -m etl.build all            # build, report, verify-sheet, check
     PYTHONPATH=src python -m etl.build test-window    # step 2 -> split.jsonl, test_window.{json,md}, baselines.json
+    PYTHONPATH=src python -m etl.build partition      # step 8 -> partition.jsonl, partition.{json,md}
 
-`test-window` is not part of `all`: the window is drawn once and then frozen.
+`test-window` and `partition` are not part of `all`: each is drawn once and then frozen.
 """
 
 from __future__ import annotations
@@ -415,6 +416,25 @@ def test_window(paths: Paths) -> tuple[dict, dict]:
     return tw, base
 
 
+def partition(paths: Paths) -> dict:
+    """Step 8. Deterministic in facts.jsonl and split.jsonl; refuses to change already-drawn partitions."""
+    facts = read_jsonl(paths.facts)
+    part = split.partition(facts, read_jsonl(paths.split))
+    rows = part.pop("rows")
+    new = jsonl_bytes(rows)
+    if paths.partition.exists() and paths.partition.read_bytes() != new:
+        raise SystemExit("partition.jsonl exists and the redrawn partitions differ. They are frozen: "
+                         "delete the step-8 files deliberately and record why before redrawing.")
+    part = {"facts_sha256": file_sha256(paths.facts), "split_sha256": file_sha256(paths.split),
+            "seeds": list(pinned.PARTITION_SEEDS), "dev_fraction": str(pinned.DEV_FRACTION),
+            "late_window_multiple": pinned.LATE_WINDOW_MULTIPLE, "checkpoint_cves": pinned.CHECKPOINT_CVES, **part}
+    stats = split.partition_stats(facts, rows)
+    paths.partition.write_bytes(new)
+    write_json(paths.partition_json, {**part, **stats})
+    paths.partition_md.write_text(split.render_partition_markdown(part, stats), encoding="utf-8")
+    return {**part, **stats}
+
+
 def check(paths: Paths) -> list[str]:
     """Row invariants over facts.jsonl. Returns a list of violations (empty = pass)."""
     graph = load_cwe_graph(paths.cwe_xml)
@@ -458,7 +478,7 @@ def check(paths: Paths) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m etl.build", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=("extract-nvd", "build", "report", "verify-sheet", "check", "all", "test-window"))
+    ap.add_argument("command", choices=("extract-nvd", "build", "report", "verify-sheet", "check", "all", "test-window", "partition"))
     ap.add_argument("--data-dir", type=Path, default=DEFAULT.data)
     ap.add_argument("--tokenizer", type=Path, help="override tokenizer.json (tests)")
     ap.add_argument("--unpinned-tokenizer", action="store_true", help="skip the tokenizer sha256 check (tests)")
@@ -481,6 +501,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"test window: {tw['final']['test']:,} of {tw['n']:,} CVEs from {tw['boundary_day']} "
               f"({len(tw['moved'])} moved to non-test); exact-ID schedule: {h['decision']} "
               f"(symmetric best {h['symmetric_top'][0]['cwe']} {h['symmetric_top'][0]['mean']:.4f})")
+        return 0
+    if args.command == "partition":
+        part = partition(paths)
+        dev = [part["seeds"][str(s)]["dev"]["cves"] for s in pinned.PARTITION_SEEDS]
+        print(f"partitions: window {part['window']:,} CVEs from {part['boundary_day']} ({len(part['moved'])} moved to train); "
+              f"dev per seed {dev}; checkpoint subsample {pinned.CHECKPOINT_CVES}")
         return 0
     if args.command in ("build", "all"):
         doc = build(paths, counter())

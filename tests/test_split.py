@@ -184,3 +184,77 @@ def test_baselines_pick_best_constant_and_break_ties_low(graph):
     assert h["adopted_schedule_top"][0]["cwe"] == "CWE-125"
     assert base["most_frequent_cwe"]["cwe"] == "CWE-125"
     assert base["cvss_majority"]["mean_component_agreement"] == 1.0
+
+
+# --- Seed partitions (step 8) ----------------------------------------------
+
+
+def pool_rows(n: int = 100, n_test: int = 15, *, clusters: dict[int, int] | None = None, days: dict[int, int] | None = None):
+    """n facts one per day (index i -> day days.get(i, i)); the last n_test are test. clusters maps a CVE
+    index to the index of its cluster's earliest member."""
+    clusters, days = clusters or {}, days or {}
+    facts, assignments = [], []
+    for i in range(n):
+        d = days.get(i, i)
+        cve = f"CVE-2020-{1000 + i}"
+        facts.append({"cve_id": cve, "published": f"2020-{1 + d // 28:02d}-{1 + d % 28:02d}T00:00:{i % 60:02d}.000",
+                      "cwe": f"CWE-{(787, 125, 476)[i % 3]}", "cvss_version": "3.1"})
+        assignments.append({"cve_id": cve, "pool": "test" if i >= n - n_test else "nontest",
+                            "cluster_id": f"CVE-2020-{1000 + clusters.get(i, i)}"})
+    return facts, assignments
+
+
+@pytest.fixture
+def small_checkpoint(monkeypatch):
+    monkeypatch.setattr(pinned, "CHECKPOINT_CVES", 5)
+
+
+def test_partition_sizes_and_seeds(small_checkpoint):
+    facts, assignments = pool_rows()
+    part = split.partition(facts, assignments)
+    assert part["window_target"] == 30 and part["window"] == 30 and part["dev_target"] == 15
+    rows = part["rows"]
+    assert len(rows) == 85 and all(r["cve_id"] < "CVE-2020-1085" for r in rows)  # test never appears
+    devs = []
+    for s in pinned.PARTITION_SEEDS:
+        dev = {r["cve_id"] for r in rows if r["role"][str(s)] == "dev"}
+        assert len(dev) == 15 and all(r["late_window"] for r in rows if r["cve_id"] in dev)
+        ckpt = {r["cve_id"] for r in rows if s in r["checkpoint_seeds"]}
+        assert len(ckpt) == 5 and ckpt <= dev
+        devs.append(dev)
+    assert len({frozenset(d) for d in devs}) == len(devs)
+    assert split.partition(facts, assignments)["rows"] == rows  # deterministic
+
+
+def test_partition_boundary_day_ties_join_the_window(small_checkpoint):
+    facts, assignments = pool_rows(days={54: 55})  # the 31st-latest non-test CVE shares the 30th's day
+    part = split.partition(facts, assignments)
+    assert part["boundary_day"] == facts[55]["published"][:10]
+    assert part["on_or_after_boundary"] == 31 and part["window"] == 31 and part["dev_target"] == 16
+
+
+def test_partition_keeps_clusters_whole(small_checkpoint):
+    # 80 duplicates 10 (straddles the boundary): both always train. 70 and 71 sit inside the window together.
+    facts, assignments = pool_rows(clusters={80: 10, 71: 70})
+    part = split.partition(facts, assignments)
+    role = {r["cve_id"]: r["role"] for r in part["rows"]}
+    assert part["moved"] == ["CVE-2020-1080"] and part["window"] == 29
+    assert all(v == "train" for c in ("CVE-2020-1010", "CVE-2020-1080") for v in role[c].values())
+    assert role["CVE-2020-1070"] == role["CVE-2020-1071"]
+
+
+def test_partition_build_refuses_a_changed_draw(tmp_path, small_checkpoint):
+    from etl import build
+    from etl.paths import Paths
+
+    facts, assignments = pool_rows()
+    paths = Paths(tmp_path)
+    build.write_jsonl(paths.facts, facts)
+    build.write_jsonl(paths.split, assignments)
+    build.partition(paths)
+    first = paths.partition.read_bytes()
+    build.partition(paths)
+    assert paths.partition.read_bytes() == first
+    paths.partition.write_bytes(first.replace(b'"dev"', b'"train"', 1))
+    with pytest.raises(SystemExit, match="frozen"):
+        build.partition(paths)

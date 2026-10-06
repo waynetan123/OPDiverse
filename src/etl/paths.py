@@ -177,5 +177,10 @@ class Paths:
     def converters(self) -> Path:
         return self.data / "converters"
 
+    # Step 10: LR sweep (file names are in sweep.files)
+    @property
+    def sweep(self) -> Path:
+        return self.data / "sweep"
+
 
 DEFAULT = Paths(ROOT / "data")

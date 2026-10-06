@@ -22,6 +22,10 @@ class TokenCounter:
     def count(self, texts: list[str]) -> list[int]:
         return [len(e.ids) for e in self._tokenizer.encode_batch(texts, add_special_tokens=False)]
 
+    def ids(self, texts: list[str]) -> list[list[int]]:
+        """Token ids, no special tokens added (special-token strings in the text still map to their ids)."""
+        return [list(e.ids) for e in self._tokenizer.encode_batch(texts, add_special_tokens=False)]
+
     def decode(self, ids: list[int]) -> str:
         """Token ids -> text, special tokens dropped (as vLLM's skip_special_tokens)."""
         return self._tokenizer.decode(ids, skip_special_tokens=True)

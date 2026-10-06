@@ -1,9 +1,9 @@
 """Pinned definitions for the OPDiverse fact table, test window, hierarchy scoring, probe, question bank,
-frozen-model session, external-model jobs, engine-agreement check, primary test, seed partitions and
-converters.
+frozen-model session, external-model jobs, engine-agreement check, primary test, seed partitions,
+converters and the LR sweep.
 
 Everything here can move a census count, a split or a score. It is frozen before step 0: any
-change needs a matching entry in docs/decisions/step{1,...,9}_decision_record.md. Pure functions,
+change needs a matching entry in docs/decisions/step{1,...,10}_decision_record.md. Pure functions,
 stdlib only, no I/O.
 """
 
@@ -422,6 +422,98 @@ MDE_GRID_MAX = 50               # points
 # sha256 of src/analysis/{primary_test,mde}.py (analysis.source_sha256). `python -m analysis` refuses to run
 # on any other source; a change needs a new value here and a decision-record entry.
 PRIMARY_TEST_SHA256: str | None = "15e75eb78f5a3ba16f064ae2665bc9b2b0574088d78aebacab456d7df345a207"
+
+# ---------------------------------------------------------------------------
+# LR sweep (step 10)
+# ---------------------------------------------------------------------------
+
+# The sweep (plan, Tuning parity): M1, partition seed 0, every arm, LR the only swept knob. SFT->DPO starts from
+# the merged SFT winner. The seed-0 winners are also M1's seed-0 keepers (owner, step 10: 123 -> 117 runs).
+SWEEP_SEED = 0
+SWEEP_CONFIG = "m1"
+SWEEP_ARMS = ("base", "sft", "distill_self", "dpo", "grpo", "sft_dpo")
+# One grid for every arm (owner, step 10). No extension if a winner lands on an edge; edges are flagged.
+LR_GRID = (1e-5, 5e-5, 2e-4)
+# Training randomness (LoRA init, GRPO sampling) is seeded with the partition seed.
+TRAIN_ORDER_SALT = "train-order"
+# Matched optimizer steps: every arm takes TRAIN_STEPS steps of TRAIN_EXAMPLES_PER_STEP rows (GRPO: prompts, each
+# with GRPO_GENERATIONS rollouts). 9,576 / 24 = 399 steps is one pass over a question-arm file. TRAIN_STEPS is
+# pinned by the owner from the pilot's measured GPU-hours (1 or 3 passes); the sweep refuses to run while it is None.
+TRAIN_EXAMPLES_PER_STEP = 24
+TRAIN_STEPS: int | None = None
+CHECKPOINTS = 4  # at round-half-up(k * TRAIN_STEPS / CHECKPOINTS), k = 1..CHECKPOINTS
+# LoRA, identical for every arm (plan: rank 16 on attention and MLP projections). alpha = r: scale 1; the LR sweep
+# absorbs the scale.
+LORA = {
+    "r": 16,
+    "lora_alpha": 16,
+    "lora_dropout": 0.0,
+    "bias": "none",
+    "target_modules": ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"),
+}
+TRAIN_DTYPE = "bfloat16"
+TRAIN_ATTENTION = "flash_attention_2"
+# transformers TrainingArguments defaults, written out so a library change cannot move them.
+OPTIMIZER = {
+    "optim": "adamw_torch",
+    "lr_scheduler_type": "linear",
+    "warmup_steps": 0,
+    "weight_decay": 0.0,
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.999,
+    "adam_epsilon": 1e-8,
+    "max_grad_norm": 1.0,
+}
+# Fused linear cross-entropy (logits of a 16k-token row over a 152k vocabulary would not fit), every arm.
+TRAIN_LIGER = True
+# Set from the pilot's memory measurement (the plan's default is off); None until then.
+GRADIENT_CHECKPOINTING: bool | None = None
+# DPO (plan: beta fixed at its published default, TRL's 0.1). pi_ref is the starting checkpoint, adapter disabled.
+DPO = {"beta": 0.1, "loss_type": "sigmoid"}
+# GRPO: what the plan and step 5 pin. Everything else is TRL GRPOConfig's default at the pinned TRL version, read by
+# the pilot and recorded in TRL_DEFAULTS; the sweep refuses to run while that is None.
+GRPO_GENERATIONS = 8
+GRPO = {
+    "num_generations": GRPO_GENERATIONS,
+    **{k: ROLLOUT_SAMPLING[k] for k in ("temperature", "top_p", "repetition_penalty")},  # step 5; vLLM gets all of it
+    "scale_rewards": "group",              # A_i = (r_i - mean(r)) / std(r), within the group (plan)
+    "num_iterations": 1,
+    "mask_truncated_completions": False,    # a cut-off rollout is scored on its text, as at step 5
+    "shuffle_dataset": False,               # the run order is ours (TRAIN_ORDER_SALT)
+    "max_completion_length": 512,           # the largest step-5 cap; each request carries its type's own cap
+}
+GRPO_RECORDED_DEFAULTS = ("beta", "loss_type", "epsilon", "epsilon_high", "importance_sampling_level",
+                          "vllm_importance_sampling_correction", "top_k", "min_p")
+# Dynamic sampling (step 5 bands): on a type banded "dynamic_sampling", a group whose rewards all tie is dropped and
+# replaced by the next prompt of the same type from a per-type queue in run order (wrapping). One replacement per
+# dropped prompt; a tied replacement is kept. How often each prompt was seen is logged.
+DYNAMIC_SAMPLING_RETRIES = 1
+# Running monitor (plan): every MONITOR_EVERY optimizer steps, per type, over that window's rollouts.
+MONITOR_EVERY = 10
+COLLAPSE_RATE = Fraction(9, 10)  # find_error: one predicted class above this over a window is a collapse
+# Weight-sync canary (plan: the one failure that gives a wrong number). Every MONITOR_EVERY steps vLLM decodes the
+# canary prompts greedily and the trainer scores those tokens under the current weights and the starting weights.
+# Once the policy has moved (gap to the start > SYNC_MIN_DRIFT nats per token), vLLM must sit nearer the current
+# weights than the start: gap_current < SYNC_RATIO x gap_start.
+SYNC_CANARY_TOKENS = 32
+SYNC_MIN_DRIFT = 0.05
+SYNC_RATIO = 0.5
+# Library versions and the TRL defaults above, recorded by the pilot (as VLLM_VERSION was by the probe).
+TRAIN_LIBS: dict | None = None
+TRL_DEFAULTS: dict | None = None
+# Selection (owner, step 10): the column-standardised mean across types, each type divided by its per-CVE spread:
+# for each evaluation, the ddof-1 SD over CVEs of the per-CVE score (find_error: the paired score); pooled as the
+# root mean of those variances over the scale evaluations (SCALE_ARMS x LR_GRID x CHECKPOINTS, on the checkpoint
+# subsample). Frozen before any checkpoint or LR is chosen; reused for checkpoint selection at steps 11 and 15.
+SCALE_ARMS = ("base", "sft", "distill_self", "dpo", "grpo")
+SELECTION_SCALE: dict | None = None
+# Paired cluster bootstrap over dev CVEs for each LR pair, reported (selection is the argmax; ties: lower LR,
+# earlier checkpoint).
+SWEEP_CI = Fraction(95, 100)
+SWEEP_BOOTSTRAP = 10_000
+SWEEP_BOOTSTRAP_SEED = 0
+# The outcome: arm -> winning LR (set when step 10 is recorded).
+SWEEP_LR: dict | None = None
 
 # Deprecated CWE-1000 weaknesses -> replacement, read from each entry's Description in the
 # 4.20 XML. A replacement is recorded only where MITRE names exactly one successor; None

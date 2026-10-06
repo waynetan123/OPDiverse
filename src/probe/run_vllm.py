@@ -56,13 +56,16 @@ def check_rendering(requests: list[dict], apply_chat_template) -> None:
                              f"{rendered!r}\n!=\n{r['prompt']!r}")
 
 
-def llm_kwargs(engine_arg_names: set[str], max_model_len: int = pinned.EVAL_MAX_MODEL_LEN) -> tuple[dict, list[str]]:
+def llm_kwargs(engine_arg_names: set[str], max_model_len: int = pinned.EVAL_MAX_MODEL_LEN,
+               model: str | None = None) -> tuple[dict, list[str]]:
     """Engine arguments; `generation_config="vllm"` stops vLLM applying Qwen's sampling defaults.
     Versions without that argument never applied model defaults, so explicit sampling suffices there.
-    max_model_len only sets capacity; it never changes the output of a sequence that fits."""
+    max_model_len only sets capacity; it never changes the output of a sequence that fits.
+    `model` is a local merged checkpoint (step 10 on); the tokenizer stays the pinned backbone's."""
+    weights = {"model": pinned.TOKENIZER_REPO, "revision": pinned.TOKENIZER_REVISION} if model is None else \
+        {"model": model, "tokenizer": pinned.TOKENIZER_REPO}
     kwargs = {
-        "model": pinned.TOKENIZER_REPO,
-        "revision": pinned.TOKENIZER_REVISION,
+        **weights,
         "tokenizer_revision": pinned.TOKENIZER_REVISION,
         "dtype": pinned.EVAL_DTYPE,
         "seed": pinned.EVAL_SAMPLING["seed"],

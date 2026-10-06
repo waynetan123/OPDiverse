@@ -19,6 +19,15 @@ def file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def tree_sha256(root: Path) -> str:
+    """sha256 over every file under `root` (relative path and content), in sorted path order: a model directory's
+    identity."""
+    h = hashlib.sha256()
+    for p in sorted(q for q in root.rglob("*") if q.is_file()):
+        h.update(str(p.relative_to(root)).encode("utf-8") + b"\0" + file_sha256(p).encode() + b"\0")
+    return h.hexdigest()
+
+
 def git_state(root: Path) -> dict:
     def git(*args: str) -> str:
         return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, check=True).stdout.strip()

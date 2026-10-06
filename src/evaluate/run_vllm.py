@@ -2,12 +2,17 @@
 
     pip install -r requirements-gpu.txt
     PYTHONPATH=src python -m evaluate.run_vllm --requests data/engine_check/vllm_a_requests.jsonl [--check-only]
+    PYTHONPATH=src python -m evaluate.run_vllm --requests data/sweep/dev_requests.jsonl \\
+        --model data/sweep/runs/sft_lr5e-05/step100/merged --out data/sweep/runs/sft_lr5e-05/step100
 
 One request file per invocation, so every pass gets a fresh engine and no prefix cache carries over
 from another file. Requests are generated in chunks; each finished chunk is appended to
 <prefix>_generations.partial.jsonl, so an interrupted run resumes where it stopped. When the file is
 complete its rows are written, in request order, to <prefix>_generations.jsonl with
-<prefix>_run_meta.json, and the partial file is removed.
+<prefix>_run_meta.json, and the partial file is removed. These sit beside the request file, or in --out.
+
+--model serves a merged checkpoint (pinned.EVAL_LORA: each LoRA adapter merged into the base weights) instead of
+the backbone; the tokenizer, chat template and decoding stay pinned, and run_meta records the checkpoint's sha256.
 
 Refuses to run on a dirty tree, under a vLLM other than pinned.VLLM_VERSION, or if any request departs
 from the pinned backbone, pinned.EVAL_SAMPLING, Qwen's chat template or pinned.EVAL_MAX_MODEL_LEN. Every
@@ -25,7 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from etl import pinned
-from etl.manifest import file_sha256, git_state
+from etl.manifest import file_sha256, git_state, tree_sha256
 from etl.paths import ROOT
 from frozen_model.run_vllm import CHUNK, DETERMINISM_CHECK, _field_names, file_stats, load_requests, run_file, sampling_kwargs
 from generators.bank.files import generations_for, partial_for, run_meta_for
@@ -41,6 +46,12 @@ JOB = "eval"
 
 def request_id(item_id: str) -> str:
     return f"{JOB}:{item_id}"
+
+
+def output_paths(requests: Path, out: Path | None = None) -> tuple[Path, Path, Path]:
+    """(generations, partial, run_meta) for a request file: beside it, or in `out`."""
+    paths = (generations_for(requests), partial_for(requests), run_meta_for(requests))
+    return paths if out is None else tuple(out / p.name for p in paths)
 
 
 def check_request_pins(requests: list[dict]) -> None:
@@ -86,6 +97,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m evaluate.run_vllm", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--requests", type=Path, required=True)
+    ap.add_argument("--model", type=Path, default=None, help="a merged checkpoint directory (default: the backbone)")
+    ap.add_argument("--out", type=Path, default=None, help="output directory (default: beside the request file)")
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     ap.add_argument("--chunk", type=int, default=CHUNK, help=f"requests per checkpoint (default {CHUNK})")
     ap.add_argument("--check-only", action="store_true", help="verify pins, tokenizer and template, then stop")
@@ -101,7 +114,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if vllm.__version__ != pinned.VLLM_VERSION:
         raise SystemExit(f"vLLM {vllm.__version__} is installed; pinned.VLLM_VERSION is {pinned.VLLM_VERSION}")
-    out_path = generations_for(args.requests)
+    out_path, partial_path, meta_path = output_paths(args.requests, args.out)
+    if args.model is not None and not (args.model / "config.json").exists():
+        raise SystemExit(f"{args.model} is not a model directory (no config.json)")
     if out_path.exists():
         print(f"{out_path} already exists: {args.requests.name} is complete")
         return 0
@@ -116,7 +131,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.check_only:
         return 0
 
-    kwargs, notes = llm_kwargs(_field_names(vllm.EngineArgs), pinned.EVAL_MAX_MODEL_LEN)
+    model_sha = None if args.model is None else tree_sha256(args.model)
+    kwargs, notes = llm_kwargs(_field_names(vllm.EngineArgs), pinned.EVAL_MAX_MODEL_LEN,
+                               None if args.model is None else str(args.model))
     for note in notes:
         warnings.warn(note)
     t0 = time.perf_counter()
@@ -136,7 +153,9 @@ def main(argv: list[str] | None = None) -> int:
     started = datetime.now(timezone.utc)
     requests_sha = file_sha256(args.requests)
     t0 = time.perf_counter()
-    done = run_file(generate, requests, partial_for(args.requests), requests_sha, args.chunk, label=args.requests.stem)
+    if args.out is not None:
+        args.out.mkdir(parents=True, exist_ok=True)
+    done = run_file(generate, requests, partial_path, requests_sha, args.chunk, label=args.requests.stem)
     gen_s = time.perf_counter() - t0
     rows = [done[r["request_id"]] for r in requests]
     recheck_requests = requests[:DETERMINISM_CHECK]
@@ -153,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
         "model": pinned.TOKENIZER_REPO,
         "revision": pinned.TOKENIZER_REVISION,
         "tokenizer_sha256": tok_sha,
+        **({} if args.model is None else {"checkpoint": str(args.model), "checkpoint_sha256": model_sha}),
         "llm_kwargs": kwargs,
         "engine_settings": engine_settings(llm),
         "notes": notes + sampling_notes,
@@ -169,9 +189,9 @@ def main(argv: list[str] | None = None) -> int:
         **file_stats(rows),
     }
     # The meta first: the generations file marks the run complete, so it is written last.
-    run_meta_for(args.requests).write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     out_path.write_text("".join(json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
-    partial_for(args.requests).unlink()
+    partial_path.unlink()
     print(f"{args.requests.name}: wrote {len(rows):,} rows; finish reasons {meta['finish_reasons']}; "
           f"determinism recheck mismatches {len(mismatched)}")
     return 0

@@ -292,3 +292,66 @@ def test_verify_item_dispatch(graph):
     assert verifiers.verify_item("line_loc", "LINES: 3", {"lines": [3], "n_lines": 9}, graph).metric == 1
     with pytest.raises(ValueError):
         verifiers.verify_item("explain", "x", {}, graph)
+
+
+# --- Parser v2 (step 7) ----------------------------------------------------------
+
+
+OPTIONS = [{"letter": "A", "cwe": "CWE-20", "name": "Improper Input Validation"},
+           {"letter": "B", "cwe": "CWE-787", "name": "Out-of-bounds Write"},
+           {"letter": "C", "cwe": "CWE-287", "name": "Improper Authentication"},
+           {"letter": "D", "cwe": "CWE-665", "name": "Improper Initialization"}]
+
+
+def test_parser_version():
+    assert verifiers.PARSER_VERSION == "v2"
+
+
+@pytest.mark.parametrize("reply, parsed", [
+    ("CWE-287: Improper Authentication", "C"),                        # the option's text, without its letter
+    ("D. CWE-665: Improper Initialization", "D"),                     # the whole option line
+    ("The input is never checked.\n\nA. CWE-20: Improper Input Validation\n", "A"),
+    ("ANSWER: B\nCWE-287: Improper Authentication", "B"),             # an ANSWER: field still wins
+    ("CWE-287: Improper Authentication. It fits.", None),             # the last line must be exactly an option
+    ("CWE-416: Use After Free", None),                                # not one of this item's options
+    ("CWE-287", None),                                                # an ID alone is not an option line
+])
+def test_parse_mcq_option_text(reply, parsed):
+    assert verifiers.parse_mcq(reply, OPTIONS) == parsed
+    assert verifiers.parse_mcq("CWE-287: Improper Authentication") is None  # without options: v1 behaviour
+
+
+def test_verify_item_mcq_option_text():
+    gold = {"letter": "C", "cwe": "CWE-287", "options": OPTIONS}
+    assert verifiers.verify_item("mcq", "CWE-287: Improper Authentication", gold, None) == \
+        verifiers.Verdict("C", True, False, Fraction(1), Fraction(1))
+
+
+@pytest.mark.parametrize("reply, parsed", [
+    ("AV:Network/AC:Low/PR:None/UI:None/S:Unchanged/C:High/I:High/A:High", "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"),
+    ("AV:NETWORK_/AC:LOW_/PR:NONE_/UI:REQUIRED/S:CHANGED/C:LOW/I:NONE/A:LOW", "AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:N/A:L"),
+    ("AV:Adjacent Network/AC:H/PR:L/UI:N/S:U/C:N/I:N/A:H", "AV:A/AC:H/PR:L/UI:N/S:U/C:N/I:N/A:H"),
+    ("AV: physical/AC:L/PR:H/UI:N/S:U/C:H/I:N/A:N", "AV:P/AC:L/PR:H/UI:N/S:U/C:H/I:N/A:N"),
+    # words outside the specification never count
+    ("AV:Networking/AC:Low/PR:Necessary/UI:Not Required/S:Single/C:N/I:N/A:H", "AV:?/AC:L/PR:?/UI:?/S:?/C:N/I:N/A:H"),
+])
+def test_parse_cvss_spec_words(reply, parsed):
+    assert verifiers.verify_cvss(reply, "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H").parsed == parsed
+
+
+def test_cvss_letters_unchanged_by_v2():
+    assert verifiers.parse_cvss("AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H") == dict(
+        zip(("AV", "AC", "PR", "UI", "S", "C", "I", "A"), "NLNNUHHH"))
+    assert verifiers.parse_cvss("AV:NA_/AC:H") == {"AC": "H"}   # 'NA' is neither a letter nor a value name
+
+
+@pytest.mark.parametrize("reply, parsed", [
+    # an echoed numbered listing, cut off before any LINES: field, is not an answer
+    ("Here is the fixed code:\n```\n1: int f(void)\n2: {\n3:     return g(4, 5);", None),
+    ("Here is the fixed code:\n1: int f(void)\n2: {\n3:     return 0;\n4: }\nLine 3 changes.", [3]),
+    ("The change:\n```c\nchar buf[16];\nmemcpy(buf, src, 8);\n```\nLines 12 and 14 are modified.", [12, 14]),
+    ("```\nLINES: 7\n```", [7]),                                   # a LINES: field is read wherever it is
+    ("Line 12 checks the length; line 17 frees it.", [12, 17]),
+])
+def test_parse_lines_ignores_echoed_code(reply, parsed):
+    assert verifiers.parse_lines(reply, 40) == parsed

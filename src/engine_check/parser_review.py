@@ -22,8 +22,10 @@ from etl import pinned, verifiers
 from etl.build import write_json
 from etl.cwe_graph import load_cwe_graph
 from etl.paths import Paths
+from etl.build import read_jsonl
 from frozen_model.files import SessionFiles
 from frozen_model.prepare import load_bank, load_results
+from generators.teacher.files import TeacherFiles
 
 from .compare import load_engines
 from .files import EngineFiles
@@ -129,3 +131,36 @@ def render_markdown(r: dict) -> str:
         f"## Examples (up to {pinned.PARSER_REVIEW_SAMPLE} per source, type and category; all failures are in parser_review.json)", "",
         *blocks,
     ])
+
+
+# ---------------------------------------------------------------------------
+# Guards: a parser change must not change what a frozen artifact means
+# ---------------------------------------------------------------------------
+
+
+def guards(paths: Paths) -> list[str]:
+    """Under the current parsers, every frozen target still scores 1 under its own verifier (bank targets
+    strictly), every DPO rejected answer is still a strict-format near miss with the dense score recorded at
+    step 6, and every distill-self target still ends in the gold answer. Returns the violations."""
+    bank, _ = load_bank(paths)
+    by_id = {r["item_id"]: r for r in bank}
+    graph = load_cwe_graph(paths.cwe_xml)
+    bad = []
+    for item in bank:
+        v = verifiers.verify_item(item["type"], item["target"], item["gold"], graph)
+        if not (v.strict_ok and v.metric == 1 and v.dense == 1):
+            bad.append(f"{item['item_id']}: bank target no longer scores 1 strictly")
+    for row in read_jsonl(TeacherFiles.of(paths).dpo):
+        item = by_id[row["item_id"]]
+        v = verifiers.verify_item(item["type"], row["rejected"], item["gold"], graph)
+        if not (v.strict_ok and v.dense < 1 and str(v.dense) == row["rejected_dense"]):
+            bad.append(f"{row['item_id']}: DPO rejected {row['rejected']!r} scores {v.dense} (step 6: {row['rejected_dense']})")
+        if row["chosen"] != item["target"]:
+            bad.append(f"{row['item_id']}: DPO chosen is not the bank target")
+    for row in read_jsonl(SessionFiles.of(paths).distill_self):
+        item = by_id[row["item_id"]]
+        v = verifiers.verify_item(item["type"], row["target"], item["gold"], graph)
+        last = row["target"].rstrip().split("\n")[-1]
+        if not (v.metric == 1 and last == item["target"]):
+            bad.append(f"{row['item_id']}: distill-self target no longer ends in the gold answer (metric {v.metric})")
+    return bad

@@ -13,6 +13,7 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from fractions import Fraction
+from pathlib import Path
 
 from etl import pinned, verifiers
 from etl.cwe_graph import CweGraph, load_cwe_graph
@@ -266,10 +267,16 @@ def run(paths: Paths) -> dict:
         "run_meta": run_meta,
     }
     for path, rows in ((paths.probe_scores, items), (paths.probe_recalled, recalled(items))):
-        path.write_text("".join(json.dumps(r, sort_keys=True, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
-    paths.probe_report_json.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    paths.probe_report_md.write_text(render_markdown(report), encoding="utf-8")
+        versioned(path).write_text("".join(json.dumps(r, sort_keys=True, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
+    versioned(paths.probe_report_json).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    versioned(paths.probe_report_md).write_text(render_markdown(report), encoding="utf-8")
     return report
+
+
+def versioned(path: Path) -> Path:
+    """The probe was scored and decided under parsers v1 (step 3); a later parser version writes its re-score
+    beside those files (report_v2.md, ...), so both stay on record."""
+    return path if verifiers.PARSER_VERSION == "v1" else path.with_name(f"{path.stem}_{verifiers.PARSER_VERSION}{path.suffix}")
 
 
 ACTIONS = {

@@ -3,6 +3,7 @@
     PYTHONPATH=src python -m engine_check prepare        # -> data/engine_check/vllm_{a,b}_requests.jsonl
     PYTHONPATH=src python -m engine_check compare        # all three runs -> engine_report.{json,md}, the decision
     PYTHONPATH=src python -m engine_check parser-review  # base-model non-test replies -> parser_review.{json,md}
+    PYTHONPATH=src python -m engine_check parser-guards  # frozen targets, DPO pairs, distill-self still valid; exit 1 if not
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from etl.tokens import TokenCounter, pinned_counter
 
 from . import compare, parser_review, prepare
 
-COMMANDS = ("prepare", "compare", "parser-review")
+COMMANDS = ("prepare", "compare", "parser-review", "parser-guards")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -38,6 +39,12 @@ def main(argv: list[str] | None = None) -> int:
         out = compare.run(paths, tokens)
         print(f"engine agreement: {out['outcome']}" + (f" on {', '.join(out['material_types'])}" if out["material_types"] else "")
               + f" (see {paths.engine_check / 'engine_report.md'})")
+    elif args.command == "parser-guards":
+        problems = parser_review.guards(paths)
+        for p in problems[:50]:
+            print(p)
+        print(f"parser guards ({parser_review.verifiers.PARSER_VERSION}): {len(problems)} violations")
+        return 1 if problems else 0
     else:
         out = parser_review.run(paths)
         print(f"parser review written ({len(out['listed']):,} replies listed); see {paths.engine_check / 'parser_review.md'}")

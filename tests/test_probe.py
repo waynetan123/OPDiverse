@@ -177,7 +177,7 @@ def test_oracle_is_large(data, fast_stats):
     rep = run_scenario(data, lambda r, f: f["cwe"] if r["question"] == "cwe" else f["cvss_vector"])
     assert rep["outcome"] == "large"
     assert rep["lenient"]["cwe_exact"]["observed"] == 1.0 and rep["lenient"]["cvss"]["observed"] == 1.0
-    assert rep["recalled"] > 0 and data.probe_report_md.read_text().startswith("# Step 3: contamination probe")
+    assert rep["recalled"] > 0 and score.versioned(data.probe_report_md).read_text().startswith("# Step 3: contamination probe")
 
 
 def test_habit_is_not_detected(data, fast_stats):
@@ -205,7 +205,7 @@ def test_partial_recall_is_material(data, fast_stats):
     cwe = rep["lenient"]["cwe_exact"]
     assert 0.05 <= cwe["margin"] < 0.15 and cwe["p"] < 0.05
     assert rep["outcome"] == "material"
-    recalled = [json.loads(line)["cve_id"] for line in data.probe_recalled.open()]
+    recalled = [json.loads(line)["cve_id"] for line in score.versioned(data.probe_recalled).open()]
     assert recalled and set(recalled) <= known
 
 
@@ -252,3 +252,13 @@ def test_generation_rows():
     (row,) = run_vllm.generation_rows([req], [out])
     assert row["text"] == "CWE-787" and row["n_prompt_tokens"] == 3 and row["n_output_tokens"] == 2
     assert row["prompt_sha256"] == pinned.sha256_text("p")
+
+
+def test_rescores_under_a_later_parser_sit_beside_v1(monkeypatch, tmp_path):
+    """The probe was decided under parsers v1; a re-score under v2 must not overwrite it."""
+    from etl import verifiers
+    monkeypatch.setattr(verifiers, "PARSER_VERSION", "v1")
+    assert score.versioned(tmp_path / "report.md") == tmp_path / "report.md"
+    monkeypatch.setattr(verifiers, "PARSER_VERSION", "v2")
+    assert score.versioned(tmp_path / "report.md") == tmp_path / "report_v2.md"
+    assert score.versioned(tmp_path / "scores.jsonl") == tmp_path / "scores_v2.jsonl"

@@ -12,6 +12,13 @@ Each verifier parses, then scores.
 Parsers are tuned on dev outputs only, never test; bump PARSER_VERSION on any change.
 MCQ, find-the-error and line localisation were added with the question bank (step 4), before
 v1 had scored any bank output, so the version stays v1.
+
+v2 (step 7, owner-approved after the parser review of the untrained backbone's non-test replies):
+- MCQ: a reply whose last line is exactly one option, with or without its letter, reads as that letter;
+- CVSS: the v3.1 specification's value names (AV:Network, S:Unchanged, ...) count as their letters;
+- line localisation: without a LINES: field, numbers in code blocks and in echoed "N: code" listing
+  lines are not read as predictions.
+Details and counts: docs/decisions/step7_decision_record.md.
 """
 
 from __future__ import annotations
@@ -22,7 +29,7 @@ from fractions import Fraction
 
 from . import pinned
 
-PARSER_VERSION = "v1"
+PARSER_VERSION = "v2"
 
 
 @dataclass(frozen=True)
@@ -71,20 +78,34 @@ def verify_exact_id(reply: str, gold: str, graph: pinned.CweLookup) -> Verdict:
 # CVSS: target "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
 # ---------------------------------------------------------------------------
 
-_CVSS_METRIC = re.compile(r"(?<![A-Za-z])(AV|AC|PR|UI|S|C|I|A)\s*:\s*([A-Za-z])(?![A-Za-z])", re.IGNORECASE)
+_CVSS_METRIC = re.compile(r"(?<![A-Za-z])(AV|AC|PR|UI|S|C|I|A)\s*:\s*(adjacent network|[A-Za-z]+)(?![A-Za-z])", re.IGNORECASE)
+# v2: the CVSS v3.1 specification's own value names, read as their letters. Other words never count.
+_CVSS_IMPACT = {"NONE": "N", "LOW": "L", "HIGH": "H"}
+CVSS_WORDS = {
+    "AV": {"NETWORK": "N", "ADJACENT NETWORK": "A", "ADJACENT": "A", "LOCAL": "L", "PHYSICAL": "P"},
+    "AC": {"LOW": "L", "HIGH": "H"},
+    "PR": dict(_CVSS_IMPACT),
+    "UI": {"NONE": "N", "REQUIRED": "R"},
+    "S": {"UNCHANGED": "U", "CHANGED": "C"},
+    "C": dict(_CVSS_IMPACT), "I": dict(_CVSS_IMPACT), "A": dict(_CVSS_IMPACT),
+}
 _CVSS_STRICT = re.compile(
     r"(?:CVSS:3\.[01]/)?" + "/".join(f"{k}:[{pinned.CVSS_ALLOWED[k]}]" for k in pinned.CVSS_ORDER)
 )
 
 
 def parse_cvss(reply: str) -> dict[str, str] | None:
-    """The last valid value of each base metric found anywhere in the reply. Invalid values
-    (e.g. 'AV:X') are ignored; metrics never given are absent. None if no metric is found."""
+    """The last valid value of each base metric found anywhere in the reply, as a letter or (v2) as the
+    specification's value name ('AV:Network'). Invalid values ('AV:X', 'S:Single') are ignored; metrics
+    never given are absent. None if no metric is found."""
     found: dict[str, str] = {}
     for key, value in _CVSS_METRIC.findall(reply):
-        key, value = key.upper(), value.upper()
-        if value in pinned.CVSS_ALLOWED[key]:
-            found[key] = value
+        key, value = key.upper(), " ".join(value.upper().split())
+        if len(value) == 1:
+            if value in pinned.CVSS_ALLOWED[key]:
+                found[key] = value
+        elif value in CVSS_WORDS[key]:
+            found[key] = CVSS_WORDS[key][value]
     return {k: found[k] for k in pinned.CVSS_ORDER if k in found} or None
 
 
@@ -121,25 +142,34 @@ _MCQ_FALLBACK = re.compile(r"\(([A-D])\)|\b(?:option|answer is)\s+([A-D])(?![A-Z
 _MCQ_STRICT = re.compile(r"ANSWER: [A-D]")
 
 
-def parse_mcq(reply: str) -> str | None:
+def parse_mcq(reply: str, options: list[dict] | None = None) -> str | None:
     """The capital letter after the last ANSWER:, else a reply that is one letter, else the last
     (X) / 'option X' / 'answer is X'. Letters must be capitals, so 'answer: a buffer overflow'
-    is not read as A."""
+    is not read as A. Else (v2, given the item's options) a last line that is exactly one option,
+    'B. CWE-787: Out-of-bounds Write' or 'CWE-787: Out-of-bounds Write', reads as that option's letter."""
     if found := _MCQ_ANSWER.findall(reply):
         return found[-1].upper()
     if m := _MCQ_LONE.fullmatch(reply):
         return m.group(1)
     found = [a or b for a, b in _MCQ_FALLBACK.findall(reply)]
     found = [f for f in found if f in pinned.MCQ_LETTERS]
-    return found[-1] if found else None
+    if found:
+        return found[-1]
+    lines = [line.strip() for line in reply.split("\n") if line.strip()]
+    if options and lines:
+        for o in options:
+            text = f"{o['cwe']}: {o['name']}"
+            if lines[-1] in (pinned.MCQ_OPTION.format(letter=o["letter"], cwe=o["cwe"], name=o["name"]), text):
+                return o["letter"]
+    return None
 
 
 def strict_mcq(reply: str) -> bool:
     return _MCQ_STRICT.fullmatch(reply.strip()) is not None
 
 
-def verify_mcq(reply: str, gold: str) -> Verdict:
-    parsed = parse_mcq(reply)
+def verify_mcq(reply: str, gold: str, options: list[dict] | None = None) -> Verdict:
+    parsed = parse_mcq(reply, options)
     if parsed is None:
         return _FAILED
     score = Fraction(parsed == gold)
@@ -212,14 +242,21 @@ def paired_cwe_accuracy(vulnerable: Verdict, patched: Verdict, gold_cwe: str) ->
 _LINES_FIELD = re.compile(r"LINES\s*:", re.IGNORECASE)
 _LINES_NONE = re.compile(r"\bnone\b", re.IGNORECASE)
 _LINES_STRICT = re.compile(r"LINES: (?:none|[1-9]\d*(?:, [1-9]\d*)*)")
+_CODE_FENCE = re.compile(r"```.*?(?:```|\Z)", re.DOTALL)  # an unclosed fence runs to the end of a cut-off reply
+_LISTING_LINE = re.compile(r"\s*\d+:")                     # an echoed line of the numbered function
+
+
+def without_code(reply: str) -> str:
+    """The reply minus code blocks and echoed "N: code" listing lines (v2's LINES:-less fallback)."""
+    return "\n".join(line for line in _CODE_FENCE.sub(" ", reply).split("\n") if not _LISTING_LINE.match(line))
 
 
 def parse_lines(reply: str, n_lines: int) -> list[int] | None:
-    """The plan's parser: text after the last LINES: (else the whole reply) -> every integer ->
-    drop those outside [1, n_lines] -> dedupe and sort. Integers found (even if all dropped) or a
-    literal 'none' parse; neither is a failure."""
+    """The plan's parser: text after the last LINES: (else the whole reply, without code blocks and
+    echoed listing lines: v2) -> every integer -> drop those outside [1, n_lines] -> dedupe and sort.
+    Integers found (even if all dropped) or a literal 'none' parse; neither is a failure."""
     fields = list(_LINES_FIELD.finditer(reply))
-    tail = reply[fields[-1].end():] if fields else reply
+    tail = reply[fields[-1].end():] if fields else without_code(reply)
     numbers = [int(x) for x in re.findall(r"\d+", tail)]
     if not numbers:
         return [] if _LINES_NONE.search(tail) else None
@@ -292,7 +329,7 @@ VERIFIERS = {
 def verify_item(item_type: str, reply: str, gold: dict, graph: pinned.CweLookup) -> Verdict:
     """Score a reply to a question-bank item from the item's `gold` field."""
     if item_type == "mcq":
-        return verify_mcq(reply, gold["letter"])
+        return verify_mcq(reply, gold["letter"], gold.get("options"))
     if item_type == "exact_id":
         return verify_exact_id(reply, gold["cwe"], graph)
     if item_type == "cvss":

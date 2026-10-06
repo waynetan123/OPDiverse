@@ -26,7 +26,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"wrote {len(requests)} requests ({len(requests) // 2} CVEs) to {paths.probe_requests}")
     else:
         report = score.run(paths)
-        print(f"probe outcome: {report['outcome']} (see {paths.probe_report_md})")
+        print(f"probe outcome: {report['outcome']} (see {score.versioned(paths.probe_report_md)})")
     return 0
 
 

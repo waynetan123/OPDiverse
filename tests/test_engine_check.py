@@ -279,3 +279,13 @@ def test_parser_review_end_to_end(data, monkeypatch):
     assert all(x["category"] != "lenient_not_strict" for x in rep["listed"])
     assert len(rep["lenient_not_strict_sample"]) <= 3 * len(pinned.BANK_TYPES) * pinned.PARSER_REVIEW_SAMPLE
     assert EngineFiles.of(data).parser_review_md.read_text().startswith("# Step 7: parser review")
+
+
+def test_parser_guards_on_the_real_artifacts():
+    """Every frozen target, DPO pair and distill-self target still means the same under the current parsers."""
+    from etl.paths import DEFAULT
+    from frozen_model.files import SessionFiles
+    from generators.teacher.files import TeacherFiles
+    if not (TeacherFiles.of(DEFAULT).dpo.exists() and SessionFiles.of(DEFAULT).distill_self.exists()):
+        pytest.skip("data/teacher or data/frozen_model not built")
+    assert parser_review.guards(DEFAULT) == []

@@ -295,7 +295,7 @@ def test_label_checks():
     assert run.label_problems(two, pos, two) == []
     assert run.label_problems(two[:4] + [-100] + two[5:], pos, two) == []          # a sequence's first token
     assert "positions" in run.label_problems(two[:3] + [-100] + two[4:], pos, two)[0]  # the end token unlabelled
-    assert "padding-free" in run.label_problems(two + [-100], pos + [4], two)[0]
+    assert "padded or truncated" in run.label_problems(two + [-100], pos + [4], two)[0]
     assert run.without_end("ANSWER: B" + END) == "ANSWER: B"
     with pytest.raises(ValueError):
         run.without_end("ANSWER: B")
@@ -321,6 +321,14 @@ def test_token_accounting():
     assert run._accum(192, 8) == 24
     with pytest.raises(SystemExit):
         run._accum(24, 5)
+
+
+def test_micro_batch_is_pinned_outside_grpo():
+    assert run.micro_batch("sft", None) == pinned.TRAIN_MICRO_BATCH == run.micro_batch("dpo", 1)
+    assert run.micro_batch("grpo", None) == 1 and run.micro_batch("grpo", 8) == 8
+    with pytest.raises(SystemExit, match="pinned"):
+        run.micro_batch("sft_dpo", 4)
+    assert pinned.TRAIN_ATTENTION == "sdpa" and "flash_attn" not in run.LIBS
 
 
 def test_run_cli_guards(monkeypatch):

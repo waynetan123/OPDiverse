@@ -8,5 +8,4 @@ peft
 accelerate
 datasets
 liger-kernel
-# flash-attn is installed on its own, after the rest: its build imports torch, which pip's isolated build cannot see.
-#   pip install ninja packaging && MAX_JOBS=8 pip install flash-attn --no-build-isolation
+# No flash-attn: training uses PyTorch's own attention (SDPA), which needs nothing installed (step 10).

@@ -13,8 +13,8 @@ Writes <out>/train_log.jsonl as it goes and <out>/run_meta.json at the end.
 Before any step it checks, and exits on any failure:
 - the tree is clean, and the libraries and TRL defaults are the pinned ones (a --pilot run records them instead);
 - every row's reference ids (train.data.encode_rows): prompts as the bank counted them, one end token per completion;
-- the trainer's prepared ids equal the reference ids (no truncation, no second end token), and a collated batch is
-  padding-free with labels exactly on the loss tokens, the end token included;
+- the trainer's prepared ids equal the reference ids (no truncation, no second end token), and a collated row is
+  unpadded, with labels exactly on the loss tokens, the end token included;
 - every arm's shared configuration fields are identical.
 --check-only stops there (GRPO: after one capped vLLM call).
 """
@@ -38,7 +38,7 @@ from etl.paths import DEFAULT, ROOT, Paths
 from . import config as cfgmod
 from . import data, grpo_logic
 
-LIBS = ("torch", "transformers", "trl", "peft", "accelerate", "datasets", "liger_kernel", "flash_attn", "vllm")
+LIBS = ("torch", "transformers", "trl", "peft", "accelerate", "datasets", "liger_kernel", "vllm")
 N_PARAMS_FLOPS = 6  # forward + backward FLOPs per parameter per trained token (the usual estimate)
 
 
@@ -76,11 +76,10 @@ def expected_labels(input_ids: list[int], mask: list[int]) -> list[int]:
 
 
 def label_problems(labels: list[int], position_ids: list[int], expected: list[int]) -> list[str]:
-    """A padding-free collated batch (one row of concatenated sequences) against the reference labels. The first token
-    of each sequence may be unlabelled either way (nothing precedes it); everything else must match exactly."""
+    """Collated labels against the reference labels, as one row (position_ids restart at 0 where a sequence starts).
+    The first token of each sequence may be unlabelled either way (nothing precedes it); everything else must match."""
     if len(labels) != len(expected) or len(position_ids) != len(expected):
-        return [f"the collated batch has {len(labels)} tokens, the reference {len(expected)}: not padding-free, "
-                "or padded, or truncated"]
+        return [f"the collated row has {len(labels)} tokens, the reference {len(expected)}: padded or truncated"]
     bad = [k for k, (a, b, p) in enumerate(zip(labels, expected, position_ids)) if a != b and not (p == 0 and a == -100)]
     return [f"labels differ from the loss mask at {len(bad)} positions, e.g. {bad[:5]}"] if bad else []
 
@@ -128,8 +127,9 @@ def parse_args(argv):
     ap.add_argument("--gradient-checkpointing", choices=("on", "off"), default=None, help="--pilot only")
     ap.add_argument("--longest-first", action="store_true",
                     help="--pilot only: train on the longest rows first, so a short run meets the worst-case memory")
-    ap.add_argument("--micro-batch", type=int, default=1,
-                    help="rows per forward pass (GRPO: completions); the step still holds TRAIN_EXAMPLES_PER_STEP rows")
+    ap.add_argument("--micro-batch", type=int, default=None,
+                    help="GRPO only: completions per forward pass (default 1); the step still holds "
+                         "TRAIN_EXAMPLES_PER_STEP prompts. The other arms run pinned.TRAIN_MICRO_BATCH rows.")
     ap.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.45)
     ap.add_argument("--check-only", action="store_true")
     return ap.parse_args(argv)
@@ -141,6 +141,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--max-steps, --gradient-checkpointing and --longest-first are for --pilot runs only")
     if args.pilot and args.gradient_checkpointing is None:
         raise SystemExit("a pilot states --gradient-checkpointing on|off, so the memory measurement is explicit")
+    args.micro_batch = micro_batch(args.arm, args.micro_batch)
     paths = Paths(args.data_dir.resolve())
     git = git_state(ROOT)
     if git["commit"] is None or git["dirty"]:
@@ -234,22 +235,22 @@ def main(argv: list[str] | None = None) -> int:
                                           "completion_mask": list(encoded[k].loss_mask)} for k in keys])
         targs = trl.SFTConfig(**common, per_device_train_batch_size=args.micro_batch,
                               gradient_accumulation_steps=_accum(pinned.TRAIN_EXAMPLES_PER_STEP, args.micro_batch),
-                              max_length=max_length, padding_free=True, packing=False,
+                              max_length=max_length, padding_free=False, packing=False,
                               completion_only_loss=not is_base, dataset_kwargs={"skip_prepare_dataset": True})
         Trainer = type("PinnedSFTTrainer", (sequential, trl.SFTTrainer), {})
         trainer = Trainer(model=model, args=targs, train_dataset=ds, processing_class=tokenizer, peft_config=lora,
                           callbacks=callbacks)
         problems = data.compare_prepared([encoded[k].input_ids for k in keys], trainer.train_dataset["input_ids"], "input_ids")
-        batch = trainer.data_collator([trainer.train_dataset[i] for i in range(min(4, len(keys)))])
-        expected = [x for k in keys[:4] for x in expected_labels(list(encoded[k].input_ids), list(encoded[k].loss_mask))]
-        problems += label_problems(batch["labels"].view(-1).tolist(), batch["position_ids"].view(-1).tolist()
-                                   if "position_ids" in batch else [], expected)
+        for i, k in enumerate(keys[:4]):   # one row per forward pass: each collates alone, unpadded
+            labels = trainer.data_collator([trainer.train_dataset[i]])["labels"].view(-1).tolist()
+            problems += label_problems(labels, list(range(len(labels))),
+                                       expected_labels(list(encoded[k].input_ids), list(encoded[k].loss_mask)))
         tokens = sft_tokens(keys, encoded)
     elif trainer_kind == "dpo":
         targs = trl.DPOConfig(**common, per_device_train_batch_size=args.micro_batch,
                               gradient_accumulation_steps=_accum(pinned.TRAIN_EXAMPLES_PER_STEP, args.micro_batch),
                               beta=pinned.DPO["beta"], loss_type=pinned.DPO["loss_type"], max_length=max_length,
-                              max_prompt_length=None, max_completion_length=None, padding_free=True,
+                              max_prompt_length=None, max_completion_length=None, padding_free=False,
                               precompute_ref_log_probs=False)
         Trainer = type("PinnedDPOTrainer", (sequential, trl.DPOTrainer), {})
         problems, trainer, end_form, tried = [], None, None, {}
@@ -373,6 +374,16 @@ def main(argv: list[str] | None = None) -> int:
 # ---------------------------------------------------------------------------
 # Trainer pieces (built against the imported libraries)
 # ---------------------------------------------------------------------------
+
+
+def micro_batch(arm: str, given: int | None) -> int:
+    """Rows (GRPO: completions) per forward pass. Under SDPA the cross-entropy and DPO arms are pinned to
+    TRAIN_MICRO_BATCH, so no row is padded or packed beside another."""
+    if cfgmod.TRAINER[arm] == "grpo":
+        return 1 if given is None else given
+    if given not in (None, pinned.TRAIN_MICRO_BATCH):
+        raise SystemExit(f"--micro-batch is pinned to {pinned.TRAIN_MICRO_BATCH} for {arm} (pinned.TRAIN_MICRO_BATCH)")
+    return pinned.TRAIN_MICRO_BATCH
 
 
 def _accum(rows_per_step: int, micro: int) -> int:

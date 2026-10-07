@@ -28,6 +28,7 @@ Pre-registration for procedure step 10: the learning-rate sweep at M1, seed 0, f
 | The selection scale (step 7's open item: there is no pooled seed SD at seed 0) | **Per-CVE spread.** For each type, the ddof-1 SD over CVEs of the per-CVE score (find-the-error: the paired score) in each evaluation, pooled as the root mean of those variances over the 60 scale evaluations (base, SFT, distill-self, DPO and GRPO × 3 LRs × 4 checkpoints, on the checkpoint subsample). Frozen before any choice. Reused for checkpoint selection at steps 11 and 15. | user |
 | LR grid | **{1e-5, 5e-5, 2e-4}**, identical for every arm. If a winner lands on an edge, the grid is not extended; the edge is flagged. | user |
 | Run length | **Pinned after the pilot**, from measured GPU-hours, before any sweep run. One pass over a question-arm file is 399 steps; the published default of 3 epochs would be 1,197. `pinned.TRAIN_STEPS` stays `None` until then, and every non-pilot run refuses to start. | user |
+| Training attention | **PyTorch SDPA**, not flash-attn. flash-attn would not build on the GPU machine: torch 2.13 is built for CUDA 13.0, and the machine's CUDA compiler is 12.8. SDPA is built into PyTorch and was step 7's HF reference attention. It cannot keep sequences apart inside one packed row, so the cross-entropy and DPO arms run **one row per forward pass** (`TRAIN_MICRO_BATCH` = 1) and build each 24-row step by gradient accumulation. There is no padding and no attention across rows, and the loss is the same. The cost: short rows can no longer share a forward pass. | user |
 | Seed-0 winners | **Reused as the M1 seed-0 keepers.** Retraining would repeat the same data, LR and run seed. The run count falls from 123 to **117**. The seed-0 keeper is "the best of three on dev"; the write-up says so. Test plays no part in the choice. | user |
 
 ### Why the scale is the per-CVE spread
@@ -50,8 +51,8 @@ The plan's yardstick, the pooled seed SD, needs several seeds. At seed 0 the per
 | Checkpoints | 4, at round-half-up(k · S / 4): 100, 200, 299, 399 at S = 399. | doc + default |
 | LoRA | r 16, alpha 16, dropout 0, no bias, on q, k, v, o, gate, up and down projections, every arm. alpha = r makes the scale 1; the LR sweep absorbs it. | doc + default |
 | Optimizer | AdamW (`adamw_torch`), linear decay to 0 over the run, no warmup, weight decay 0, betas 0.9 / 0.999, eps 1e-8, gradient-norm clip 1.0: transformers' defaults, written out. | default |
-| Precision, attention | bf16 weights; Flash Attention 2; Liger kernels (fused linear cross-entropy), every arm. A 16k-token row's logits over a 152k vocabulary would not otherwise fit. | doc + default |
-| Batching | **Padding-free** within a step: a micro-batch's sequences are concatenated with `position_ids`, so there is no padding and no attention across documents. This replaces the plan's cross-example *packing* for the cross-entropy arms. Packing would put a different number of examples in each arm's step and break matched steps. | default |
+| Precision, attention | bf16 weights; PyTorch SDPA attention (owner, above); Liger kernels (fused linear cross-entropy), every arm. A 16k-token row's logits over a 152k vocabulary would not otherwise fit. | user + default |
+| Batching | **One row per forward pass** for base, SFT, distill-self, DPO and SFT→DPO (a DPO row is its chosen and rejected pair). The step's 24 rows are accumulated, so there is no padding and no attention across documents. This replaces the plan's cross-example *packing*, which would put a different number of examples in each arm's step and break matched steps, and which SDPA cannot mask. GRPO's micro-batches of completions are padded and masked; their size is set by the pilot. | user + default |
 | Gradient checkpointing | Set from the pilot's memory measurement (the plan's default is off). It is expected to be on: the longest rows are 16–20k tokens. | doc |
 | Loss | SFT and distill-self: completion tokens only. Base: every token. All three are normalised as a token mean over the step's 24 rows. distill-self's ~400-token rationales therefore weigh more per row than SFT's ~10-token answers, as cross-entropy does. | default |
 | DPO | β 0.1, sigmoid loss (TRL's defaults, written out). π_ref is the starting checkpoint with the adapter disabled. **SFT→DPO** starts from the merged SFT winner (selected LR and checkpoint), and π_ref is that model. | doc + default |
@@ -84,9 +85,9 @@ The plan's yardstick, the pooled seed SD, needs several seeds. At seed 0 the per
 ## Pilot (decides nothing about results)
 
 Its outputs never enter selection and go to `data/sweep/pilot/`. It records:
-- **Memory.** Each arm at the middle LR (5e-5), `--longest-first` (the longest rows train first), a few steps, with gradient checkpointing off and then on. The worst cases are the 19,796-token base document, DPO pairs of about 2 × 16k, a line-localisation GRPO group (8 × about 16.5k) and a 16.4k distill-self row. This sets `GRADIENT_CHECKPOINTING`, each arm's micro-batch, and the vLLM memory fraction (at least about 0.45 in colocate mode).
+- **Memory.** Each arm at the middle LR (5e-5), `--longest-first` (the longest rows train first), a few steps, with gradient checkpointing off and then on. The worst cases are the 19,796-token base document, DPO pairs of about 2 × 16k, a line-localisation GRPO group (8 × about 16.5k) and a 16.4k distill-self row. This sets `GRADIENT_CHECKPOINTING`, GRPO's micro-batch, and the vLLM memory fraction (at least about 0.45 in colocate mode).
 - **Cost.** About 20 steps per arm in pilot order, giving measured GPU-hours per step. Before the pilot, the token counts suggest roughly 3–9 GPU-h for a 399-step run of the cross-entropy and DPO arms, and **20–30 GPU-h for GRPO**. That is 2–3× the plan's budget per GRPO run.
-- **Versions and defaults.** `TRAIN_LIBS` (torch, transformers, trl, peft, accelerate, datasets, liger-kernel, flash-attn, vLLM) and `TRL_DEFAULTS`.
+- **Versions and defaults.** `TRAIN_LIBS` (torch, transformers, trl, peft, accelerate, datasets, liger-kernel, vLLM) and `TRL_DEFAULTS`.
 
 **Server mode:** the per-type cap wrapper works in TRL's colocate mode, the plan's expected choice on 4 × A40. Measuring server mode would first need the wrapper extended to TRL's vLLM client. If colocate is too slow, that becomes an owner decision, recorded here.
 
@@ -97,7 +98,7 @@ Its outputs never enter selection and go to `data/sweep/pilot/`. It records:
 1. Commit the code, the pins, this record and the plan-document edits.
 2. `PYTHONPATH=src python -m sweep prepare`. Already written; the rerun is byte-identical: `dev_requests.jsonl` `e27e5f9b…39a85082`, `checkpoint_requests.jsonl` `afe19ded…667b3944`.
 3. On the GPU machine, at that commit:
-   - `pip install -r requirements-gpu.txt`, holding the installed torch, transformers and vLLM where they are (a constraints file of their `pip freeze` lines), then `pip install flash-attn --no-build-isolation`, since its build imports torch;
+   - `pip install -r requirements-gpu.txt`, holding the installed torch, transformers and vLLM where they are (a constraints file of their `pip freeze` lines). flash-attn is not used;
    - copy `data/` over: `bank/`, `combined_dataset/`, `converters/`, `mitre_cwe/`, `sweep/*_requests.jsonl`.
 4. **Pilot**, for each arm A in base, sft, distill_self, dpo and grpo:
    - `python -m train.run --arm A --lr 5e-5 --pilot --max-steps 8 --longest-first --gradient-checkpointing off --check-only`, then without `--check-only`;
@@ -141,4 +142,5 @@ Its outputs never enter selection and go to `data/sweep/pilot/`. It records:
 - Selection standardises each type by its per-CVE spread, not the pooled seed SD, which does not exist at seed 0.
 - The grid is {1e-5, 5e-5, 2e-4}, and run length is pinned from the pilot.
 - The seed-0 winners are the M1 seed-0 keepers: 117 runs, not 123.
-- The cross-entropy arms use padding-free batching instead of cross-example packing, so every arm's step holds the same 24 rows.
+- Training attention is PyTorch SDPA, not Flash Attention 2 (owner: flash-attn would not build against CUDA 13).
+- The cross-entropy and DPO arms run one row per forward pass instead of cross-example packing, so every arm's step holds the same 24 rows.

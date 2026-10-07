@@ -128,9 +128,9 @@ Because the pool is _all_ non-test items rather than one seed's train set, this 
 An efficiency change applied to some arms and not others is a confound. Everything here is uniform, or its non-applicability is structural and recorded.
 
 - **One training job per GPU.** A 7B with LoRA fits on a single A40. Sharding across four cards with FSDP or ZeRO-3 gains nothing and costs 30–50% to PCIe communication on hardware without NVLink. The workload is 120 embarrassingly parallel runs; run four at once.
-- **Flash Attention 2** everywhere (Ampere is supported).
+- **Flash Attention 2** everywhere (Ampere is supported). _Changed at step 10 (owner):_ PyTorch's built-in SDPA attention instead, uniformly, because flash-attn would not build against the GPU machine's CUDA 13 torch.
 - **Gradient checkpointing off** unless memory measurement says otherwise. It trades ~30% more compute for memory you likely do not need.
-- **Sequence packing** for the cross-entropy arms (base, SFT, distill-self), with attention masking so no sequence attends across a document boundary. Structurally inapplicable to DPO (paired) and GRPO (per-prompt groups); recorded in the per-arm config rather than treated as an oversight. _Pinned at step 10:_ padding-free batching within a step (no padding, no attention across documents) instead of cross-example packing, so every arm's optimizer step holds the same 24 rows.
+- **Sequence packing** for the cross-entropy arms (base, SFT, distill-self), with attention masking so no sequence attends across a document boundary. Structurally inapplicable to DPO (paired) and GRPO (per-prompt groups); recorded in the per-arm config rather than treated as an oversight. _Pinned at step 10:_ one row per forward pass, accumulated into a 24-row step (no padding, no attention across documents), instead of cross-example packing. Every arm's optimizer step then holds the same 24 rows, and SDPA needs no cross-row masking.
 - **Length bucketing** for DPO and GRPO, recovering most of what packing would have.
 - **LoRA rank 16** on attention and MLP projections, identical across all arms.
 

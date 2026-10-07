@@ -452,7 +452,12 @@ LORA = {
     "target_modules": ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"),
 }
 TRAIN_DTYPE = "bfloat16"
-TRAIN_ATTENTION = "flash_attention_2"
+# PyTorch SDPA (owner, step 10), not flash-attn, which would not build against torch 2.13 + CUDA 13 on the GPU machine.
+# SDPA cannot keep sequences apart inside one packed row, so the cross-entropy and DPO arms run TRAIN_MICRO_BATCH = 1
+# row per forward pass and build each step's TRAIN_EXAMPLES_PER_STEP rows by gradient accumulation: no padding, no
+# attention across rows, the same loss. GRPO's micro-batches of completions are padded and masked, which SDPA handles.
+TRAIN_ATTENTION = "sdpa"
+TRAIN_MICRO_BATCH = 1
 # transformers TrainingArguments defaults, written out so a library change cannot move them.
 OPTIMIZER = {
     "optim": "adamw_torch",

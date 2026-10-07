@@ -30,6 +30,61 @@ def rewards(vs: list[verifiers.Verdict]) -> list[float]:
 
 
 # ---------------------------------------------------------------------------
+# Finding TRL's internals (they move between TRL versions)
+# ---------------------------------------------------------------------------
+
+# Methods that push the trainer's weights into vLLM, by TRL version, looked for on the trainer, then on the object
+# holding the vLLM engine.
+SYNC_METHODS = ("_move_model_to_vllm", "sync_weights", "_sync_weights", "update_vllm_weights", "load_weights")
+
+
+def find_instances(root, cls, depth: int = 2) -> list[tuple[str, object]]:
+    """(attribute path, object) for every instance of `cls` reachable from `root` through at most `depth` plain
+    attributes (instance __dict__ only, so no property runs), each object once, shortest path first."""
+    found, seen = [], {id(root)}
+    level = [("", root)]
+    for _ in range(depth):
+        nxt = []
+        for path, obj in level:
+            for name, value in list(getattr(obj, "__dict__", {}).items()):
+                if id(value) in seen:
+                    continue
+                seen.add(id(value))
+                p = f"{path}.{name}" if path else name
+                if isinstance(value, cls):
+                    found.append((p, value))
+                else:
+                    nxt.append((p, value))
+        level = nxt
+    return found
+
+
+def resolve(root, path: str):
+    obj = root
+    for name in filter(None, path.split(".")):
+        obj = getattr(obj, name)
+    return obj
+
+
+def parent_path(path: str) -> str:
+    return path.rpartition(".")[0]
+
+
+def find_method(owners: list[tuple[str, object]], names: tuple[str, ...]) -> tuple[str, object, str] | None:
+    """(owner path, owner, method name) for the first of `names` callable on the first owner that has one."""
+    for path, owner in owners:
+        for name in names:
+            if callable(getattr(owner, name, None)):
+                return path, owner, name
+    return None
+
+
+def names_like(obj, words: tuple[str, ...]) -> list[str]:
+    """Attribute names on obj (class and instance) containing any of `words`, for an error that says where to look."""
+    return sorted({n for n in dir(obj) if any(w in n.lower() for w in words)})
+
+
+# ---------------------------------------------------------------------------
 # Per-type caps
 # ---------------------------------------------------------------------------
 

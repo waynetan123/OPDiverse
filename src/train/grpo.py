@@ -10,8 +10,11 @@
 - The weight-sync canary runs every MONITOR_EVERY steps after the weights are moved to vLLM (grpo_logic.sync_verdict);
   a failure stops the run.
 
-Everything here leans on TRL internals (`llm`, `_generate_and_score_completions`, `_move_model_to_vllm`, the output
-dict's keys). `python -m train.run --arm grpo --check-only` exercises each hook before any step.
+Everything here leans on TRL internals that move between versions: where the vLLM engine is kept, the weight-sync
+method, `_generate_and_score_completions` and its output dict's keys. The engine is found by searching the trainer for
+the vllm.LLM instance, and the sync method by name (grpo_logic.SYNC_METHODS); each hook must exist, or the trainer
+stops at construction and lists what this TRL has instead, so no hook can be silently skipped.
+`python -m train.run --arm grpo --check-only` exercises each one before any step.
 """
 
 from __future__ import annotations
@@ -69,10 +72,32 @@ def trainer_class(trl, torch, vllm, sampling_kwargs, field_names):
             self.spliced_keys: set[str] = set()
             self.sync_checks: list[dict] = []
             self.generated_tokens = 0
-            if getattr(self, "llm", None) is None:
-                raise SystemExit("GRPO runs with vLLM in colocate mode; per-type caps are applied there")
-            self.raw_generate = self.llm.generate
-            self.llm.generate = self.capped_generate
+            if not callable(getattr(trl.GRPOTrainer, "_generate_and_score_completions", None)):
+                raise SystemExit("this TRL's GRPOTrainer has no _generate_and_score_completions (dynamic sampling and the "
+                                 f"monitor hook it); generation-related methods: {grpo_logic.names_like(self, ('generat',))}")
+            found = grpo_logic.find_instances(self, vllm.LLM)
+            if len(found) != 1:
+                raise SystemExit(f"expected one vLLM engine on the trainer (colocate mode), found {[p for p, _ in found]}; "
+                                 f"vLLM-related attributes: {grpo_logic.names_like(self, ('vllm', 'llm'))}")
+            self.vllm_path, self.vllm_llm = found[0]
+            self.raw_generate = self.vllm_llm.generate
+            self.vllm_llm.generate = self.capped_generate
+            holder_path = grpo_logic.parent_path(self.vllm_path)
+            owners = [("trainer", self)] + ([(holder_path, grpo_logic.resolve(self, holder_path))] if holder_path else [])
+            hook = grpo_logic.find_method(owners, grpo_logic.SYNC_METHODS)
+            if hook is None:
+                raise SystemExit("found no weight-sync method " + str(grpo_logic.SYNC_METHODS) + "; candidates: "
+                                 + "; ".join(f"{p}: {grpo_logic.names_like(o, ('sync', 'weight', 'move'))}" for p, o in owners))
+            owner_path, owner, name = hook
+            self.sync_hook = f"{owner_path}.{name}"
+            original = getattr(owner, name)
+
+            def synced(*a, **kw):
+                result = original(*a, **kw)
+                self.after_sync()
+                return result
+
+            setattr(owner, name, synced)
 
         # --- per-type caps ---------------------------------------------------------------------------------
 
@@ -143,12 +168,11 @@ def trainer_class(trl, torch, vllm, sampling_kwargs, field_names):
 
         # --- weight sync ------------------------------------------------------------------------------------
 
-        def _move_model_to_vllm(self, *args, **kwargs):
-            result = super()._move_model_to_vllm(*args, **kwargs)
+        def after_sync(self):
+            """Runs after every weight push to vLLM; the canary check every MONITOR_EVERY steps."""
             step = self.state.global_step
             if step and step % pinned.MONITOR_EVERY == 0 and all(c["step"] != step for c in self.sync_checks):
                 self.sync_check(step)
-            return result
 
         def token_logprobs(self, prompt_ids: list[int], tokens: list[int]) -> list[float]:
             model = self.accelerator.unwrap_model(self.model)

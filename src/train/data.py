@@ -170,6 +170,32 @@ def compare_prepared(reference: list[tuple[int, ...]], prepared: list[list[int]]
     return out
 
 
+# TRL's prepared DPO token columns, by version: (prompt, chosen, rejected).
+DPO_COLUMNS = (("prompt_input_ids", "chosen_input_ids", "rejected_input_ids"),
+               ("prompt_ids", "chosen_ids", "rejected_ids"))
+
+
+def dpo_prepared_problems(reference: list[Encoded], column_names: list[str], column) -> tuple[list[str], str | None]:
+    """TRL's prepared DPO ids against the reference, whatever this TRL calls its columns, and whether it stores the
+    chosen and rejected ids on their own or after the prompt. column(name) -> that column's rows. Returns (problems,
+    the layout that matched or None)."""
+    found = [names for names in DPO_COLUMNS if set(names) <= set(column_names)]
+    if not found:
+        return [f"no known DPO token columns; TRL's prepared dataset has {sorted(column_names)}"], None
+    p, c, r = found[0]
+    prompts = [e.prompt_ids for e in reference]
+    prompt_bad = compare_prepared(prompts, column(p), "prompt")
+    chosen, rejected = column(c), column(r)
+    first = []
+    for layout, join in (("separate", lambda e, x: x), ("after the prompt", lambda e, x: e.prompt_ids + x)):
+        bad = prompt_bad + compare_prepared([join(e, e.chosen_ids) for e in reference], chosen, "chosen") \
+            + compare_prepared([join(e, e.rejected_ids) for e in reference], rejected, "rejected")
+        if not bad:
+            return [], f"{p}, {c}, {r} ({layout})"
+        first = first or bad
+    return first, None
+
+
 def grpo_dataset_rows(rows: list[dict]) -> list[dict]:
     """What the GRPO trainer's dataset carries per row: the prompt text and what the reward and caps need. The gold
     is JSON text, because the types' gold dicts have different fields."""

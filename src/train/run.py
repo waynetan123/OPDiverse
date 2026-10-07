@@ -274,9 +274,9 @@ def main(argv: list[str] | None = None) -> int:
             trainer = Trainer(model=model, args=targs, train_dataset=ds, processing_class=tokenizer, peft_config=lora,
                               callbacks=callbacks)
             prep = trainer.train_dataset
-            problems = (data.compare_prepared([encoded[k].prompt_ids for k in keys], prep["prompt_input_ids"], "prompt")
-                        + data.compare_prepared([encoded[k].chosen_ids for k in keys], prep["chosen_input_ids"], "chosen")
-                        + data.compare_prepared([encoded[k].rejected_ids for k in keys], prep["rejected_input_ids"], "rejected"))
+            problems, layout = data.dpo_prepared_problems([encoded[k] for k in keys], prep.column_names,
+                                                          lambda name: prep[name])
+            extra_meta["dpo_prepared_columns"] = layout
             tried[end_form] = problems
             if not problems:
                 break
@@ -322,6 +322,8 @@ def main(argv: list[str] | None = None) -> int:
                           dynamic_types=dynamic, rows_by_item=rows_by_item, graph=load_cwe_graph(paths.cwe_xml),
                           monitor=monitor, canary=canary, stop_ids=stop_ids, write_log=write_log)
         holder["trainer"] = trainer
+        extra_meta.update(vllm_engine_at=trainer.vllm_path, weight_sync_hook=trainer.sync_hook)
+        print(f"vLLM engine at trainer.{trainer.vllm_path}; weight-sync hook {trainer.sync_hook}")
         trainer.add_callback(_monitor_flush(transformers, monitor, write_log))
         problems = []
         if trainer.args.gradient_accumulation_steps * args.micro_batch != per_step:
@@ -331,7 +333,7 @@ def main(argv: list[str] | None = None) -> int:
             problems.append(f"TRL generates {gen_batch} completions per batch, not one optimizer step's {per_step}")
         if not problems:   # one call through the cap wrapper: an MCQ prompt and a line-localisation prompt
             first = [next(r["prompt"] for r in ds_rows if r["type"] == t) for t in ("mcq", "line_loc")]
-            trial = trainer.llm.generate(first, vllm.SamplingParams(**{**pinned.ROLLOUT_SAMPLING, "n": 1, "max_tokens": 512}))
+            trial = trainer.vllm_llm.generate(first, vllm.SamplingParams(**{**pinned.ROLLOUT_SAMPLING, "n": 1, "max_tokens": 512}))
             seen = [len(o.outputs[0].token_ids) for o in trial]
             if any(n > by_text[p] for n, p in zip(seen, first)):
                 problems.append(f"vLLM returned {seen} tokens under caps {[by_text[p] for p in first]}")

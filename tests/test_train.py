@@ -4,6 +4,7 @@ queue, groups, monitor, weight-sync decision), and the runner's pure checks. Not
 
 import json
 from fractions import Fraction
+from types import SimpleNamespace
 
 import pytest
 
@@ -185,6 +186,20 @@ def test_compare_prepared():
     assert "token 2" in tdata.compare_prepared(ref, [[5, 6], [7, 1]], "x")[0]          # truncated
     assert "row 1" in tdata.compare_prepared(ref, [[5, 6, 1], [7, 1, 1]], "x")[0]      # a second end token
     assert "prepared 1 rows" in tdata.compare_prepared(ref, [[5, 6, 1]], "x")[0]
+
+
+def test_dpo_prepared_columns_any_layout():
+    ref = [tdata.Encoded(("a", "0"), prompt_ids=(7, 8), chosen_ids=(5, 1), rejected_ids=(6, 1))]
+    old = {"prompt_input_ids": [[7, 8]], "chosen_input_ids": [[5, 1]], "rejected_input_ids": [[6, 1]], "prompt": ["x"]}
+    assert tdata.dpo_prepared_problems(ref, list(old), old.get) == ([], "prompt_input_ids, chosen_input_ids, "
+                                                                        "rejected_input_ids (separate)")
+    new = {"prompt_ids": [[7, 8]], "chosen_ids": [[7, 8, 5, 1]], "rejected_ids": [[7, 8, 6, 1]]}
+    assert tdata.dpo_prepared_problems(ref, list(new), new.get)[1] == "prompt_ids, chosen_ids, rejected_ids (after the prompt)"
+    doubled = dict(new, chosen_ids=[[7, 8, 5, 1, 1]])
+    bad, layout = tdata.dpo_prepared_problems(ref, list(doubled), doubled.get)
+    assert layout is None and any("chosen" in b for b in bad)
+    bad, layout = tdata.dpo_prepared_problems(ref, ["prompt", "chosen"], {}.get)
+    assert layout is None and "['chosen', 'prompt']" in bad[0]
 
 
 def test_grpo_dataset_rows(built):
@@ -389,3 +404,40 @@ def test_eval_runner_serves_a_merged_checkpoint(tmp_path):
 def test_shared_fields_cover_the_plan_parity_pins():
     assert {"steps", "examples_per_step", "lora", "optimizer", "checkpoint_steps"} <= set(config.SHARED)
     assert Fraction(9576, pinned.TRAIN_EXAMPLES_PER_STEP) == 399
+
+
+def test_find_trl_internals_wherever_they_live():
+    class LLM:
+        def generate(self): ...
+
+    class Generation:          # newer TRL: the engine sits on a helper object, which owns the sync
+        def __init__(self):
+            self.llm = LLM()
+
+        def sync_weights(self): ...
+
+    class OldTrainer:           # older TRL: trainer.llm, trainer._move_model_to_vllm
+        def __init__(self):
+            self.llm = LLM()
+            self.args = SimpleNamespace(x=1)
+
+        def _move_model_to_vllm(self): ...
+
+    class NewTrainer:
+        def __init__(self):
+            self.vllm_generation = Generation()
+
+    old, new = OldTrainer(), NewTrainer()
+    assert [p for p, _ in grpo_logic.find_instances(old, LLM)] == ["llm"]
+    (path, llm), = grpo_logic.find_instances(new, LLM)
+    assert path == "vllm_generation.llm" and llm is new.vllm_generation.llm
+    holder = grpo_logic.parent_path(path)
+    assert holder == "vllm_generation" and grpo_logic.resolve(new, holder) is new.vllm_generation
+    owners = [("trainer", new), (holder, grpo_logic.resolve(new, holder))]
+    assert grpo_logic.find_method(owners, grpo_logic.SYNC_METHODS)[::2] == ("vllm_generation", "sync_weights")
+    assert grpo_logic.find_method([("trainer", old)], grpo_logic.SYNC_METHODS)[::2] == ("trainer", "_move_model_to_vllm")
+    assert grpo_logic.find_method([("trainer", NewTrainer())], grpo_logic.SYNC_METHODS) is None
+    assert "sync_weights" in grpo_logic.names_like(Generation(), ("sync",))
+    shared = LLM()                                      # one engine reachable two ways is one engine
+    both = SimpleNamespace(a=shared, b=SimpleNamespace(c=shared))
+    assert len(grpo_logic.find_instances(both, LLM)) == 1

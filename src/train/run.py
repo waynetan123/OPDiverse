@@ -4,6 +4,7 @@
     PYTHONPATH=src python -m train.run --arm sft --lr 5e-5 [--check-only]
     PYTHONPATH=src python -m train.run --arm sft_dpo --lr 5e-5 --init data/sweep/runs/sft_lr5e-05/step200/merged
     PYTHONPATH=src python -m train.run --arm grpo --lr 5e-5 --pilot --max-steps 20 --gradient-checkpointing on
+    PYTHONPATH=src python -m train.run --arm grpo --lr 5e-5 --vllm-server-port 8000   # server mode: `trl vllm-serve` running
 
 Reads the frozen step-9 file for (arm, configuration, seed) through manifest.json, in the run order (train.data), and
 trains pinned.TRAIN_STEPS optimizer steps of TRAIN_EXAMPLES_PER_STEP rows with the pinned LoRA and optimizer. Adapters
@@ -57,12 +58,41 @@ def installed_versions(names=LIBS) -> dict[str, str | None]:
     return out
 
 
-def readiness(pilot: bool) -> list[str]:
+def readiness(pilot: bool, arm: str | None = None) -> list[str]:
     """Pins the sweep cannot run without; a pilot runs before them and records what it measured."""
     if pilot:
         return []
-    return [name for name in ("TRAIN_STEPS", "GRADIENT_CHECKPOINTING", "TRAIN_LIBS", "TRL_DEFAULTS")
-            if getattr(pinned, name) is None]
+    names = ("TRAIN_STEPS", "GRADIENT_CHECKPOINTING", "TRAIN_LIBS", "TRL_DEFAULTS") + \
+        (("GRPO_VLLM_MODE",) if arm is not None and cfgmod.TRAINER[arm] == "grpo" else ())
+    return [name for name in names if getattr(pinned, name) is None]
+
+
+def vllm_mode(arm: str, pilot: bool, given: str | None) -> str | None:
+    """Where GRPO's vLLM runs: a pilot says (--vllm-mode, default colocate); a sweep run uses pinned.GRPO_VLLM_MODE."""
+    if cfgmod.TRAINER[arm] != "grpo":
+        if given is not None:
+            raise SystemExit("--vllm-mode is for GRPO only")
+        return None
+    if not pilot:
+        if given is not None:
+            raise SystemExit("--vllm-mode is for --pilot runs; sweep runs use pinned.GRPO_VLLM_MODE")
+        return pinned.GRPO_VLLM_MODE
+    return given or "colocate"
+
+
+def server_fields(config_cls, host: str, port: int, group_port: int) -> dict:
+    """TRL's server-mode config fields, by whichever names this TRL has (host and port, or a base URL)."""
+    names = {f.name for f in dataclasses.fields(config_cls)}
+    out = {}
+    if "vllm_server_base_url" in names and "vllm_server_port" not in names:
+        out["vllm_server_base_url"] = f"http://{host}:{port}"
+    elif "vllm_server_port" in names:
+        out.update({k: v for k, v in (("vllm_server_host", host), ("vllm_server_port", port)) if k in names})
+    else:
+        raise SystemExit(f"this TRL's GRPOConfig has no server address field; vLLM fields: {sorted(n for n in names if 'vllm' in n)}")
+    if "vllm_group_port" in names:
+        out["vllm_group_port"] = group_port
+    return out
 
 
 def version_drift(installed: dict, pinned_libs: dict | None) -> list[str]:
@@ -142,7 +172,13 @@ def parse_args(argv):
     ap.add_argument("--micro-batch", type=int, default=None,
                     help="GRPO only: completions per forward pass (default 1); the step still holds "
                          "TRAIN_EXAMPLES_PER_STEP prompts. The other arms run pinned.TRAIN_MICRO_BATCH rows.")
-    ap.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.45)
+    ap.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.45, help="GRPO colocate mode only")
+    ap.add_argument("--vllm-mode", choices=pinned.GRPO_VLLM_MODES, default=None,
+                    help="GRPO --pilot only (default colocate); sweep runs use pinned.GRPO_VLLM_MODE")
+    ap.add_argument("--vllm-server-host", default="127.0.0.1", help="GRPO server mode: where `trl vllm-serve` listens")
+    ap.add_argument("--vllm-server-port", type=int, default=8000, help="GRPO server mode: its HTTP port")
+    ap.add_argument("--vllm-group-port", type=int, default=51216,
+                    help="GRPO server mode: the weight-sync port (each concurrent server needs its own)")
     ap.add_argument("--check-only", action="store_true")
     return ap.parse_args(argv)
 
@@ -154,11 +190,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.pilot and args.gradient_checkpointing is None:
         raise SystemExit("a pilot states --gradient-checkpointing on|off, so the memory measurement is explicit")
     args.micro_batch = micro_batch(args.arm, args.micro_batch)
+    args.vllm_mode = vllm_mode(args.arm, args.pilot, args.vllm_mode)
     paths = Paths(args.data_dir.resolve())
     git = git_state(ROOT)
     if git["commit"] is None or git["dirty"]:
         raise SystemExit(f"commit the code and pins before the GPU run (git state: {git})")
-    missing = readiness(args.pilot)
+    missing = readiness(args.pilot, args.arm)
     if missing:
         raise SystemExit(f"pins still None: {missing}; the pilot sets them (docs/decisions/step10_decision_record.md)")
     versions = installed_versions()
@@ -195,6 +232,8 @@ def main(argv: list[str] | None = None) -> int:
     cfg = cfgmod.resolved(args.arm, args.lr, steps, init, args.config, args.seed,
                           trl_defaults if trainer_kind == "grpo" else None)
     cfg["gradient_checkpointing"] = grad_ckpt
+    if trainer_kind == "grpo":
+        cfg["grpo"]["vllm_mode"] = args.vllm_mode
     cfgmod.check_shared([cfg] + [dict(cfgmod.resolved(a, args.lr, steps, {"kind": "merged"} if a == "sft_dpo" else None,
                                                       args.config, args.seed), gradient_checkpointing=grad_ckpt)
                                  for a in pinned.SWEEP_ARMS if a != args.arm and not (a == "base" and args.config != "m1")])
@@ -299,11 +338,15 @@ def main(argv: list[str] | None = None) -> int:
         rows_by_item = {r["item_id"]: r for r in data.grpo_dataset_rows(rows)}
         per_step = pinned.TRAIN_EXAMPLES_PER_STEP * pinned.GRPO_GENERATIONS
         opt, extra_meta["truncation_args_absent"] = optional_fields(trl.GRPOConfig, {"max_prompt_length": None})
+        if args.vllm_mode == "colocate":
+            placement = {"vllm_gpu_memory_utilization": args.vllm_gpu_memory_utilization,
+                         "vllm_max_model_length": pinned.EVAL_MAX_MODEL_LEN}
+        else:
+            placement = server_fields(trl.GRPOConfig, args.vllm_server_host, args.vllm_server_port, args.vllm_group_port)
+            extra_meta["vllm_server"] = placement
         targs = trl.GRPOConfig(**common, **pinned.GRPO, **opt, per_device_train_batch_size=args.micro_batch,
                                gradient_accumulation_steps=_accum(per_step, args.micro_batch),
-                               use_vllm=True, vllm_mode="colocate",
-                               vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
-                               vllm_max_model_length=pinned.EVAL_MAX_MODEL_LEN)
+                               use_vllm=True, vllm_mode=args.vllm_mode, **placement)
         holder: dict = {}
 
         def dense(prompts, completions, **kwargs):
@@ -322,8 +365,8 @@ def main(argv: list[str] | None = None) -> int:
                           dynamic_types=dynamic, rows_by_item=rows_by_item, graph=load_cwe_graph(paths.cwe_xml),
                           monitor=monitor, canary=canary, stop_ids=stop_ids, write_log=write_log)
         holder["trainer"] = trainer
-        extra_meta.update(vllm_engine_at=trainer.vllm_path, weight_sync_hook=trainer.sync_hook)
-        print(f"vLLM engine at trainer.{trainer.vllm_path}; weight-sync hook {trainer.sync_hook}")
+        extra_meta.update(vllm_mode=args.vllm_mode, vllm_engine_at=trainer.vllm_path, weight_sync_hook=trainer.sync_hook)
+        print(f"vLLM {args.vllm_mode} mode, at trainer.{trainer.vllm_path}; weight-sync hook {trainer.sync_hook}")
         trainer.add_callback(_monitor_flush(transformers, monitor, write_log))
         problems = []
         if trainer.args.gradient_accumulation_steps * args.micro_batch != per_step:
@@ -333,12 +376,11 @@ def main(argv: list[str] | None = None) -> int:
             problems.append(f"TRL generates {gen_batch} completions per batch, not one optimizer step's {per_step}")
         if not problems:   # one call through the cap wrapper: an MCQ prompt and a line-localisation prompt
             first = [next(r["prompt"] for r in ds_rows if r["type"] == t) for t in ("mcq", "line_loc")]
-            trial = trainer.vllm_llm.generate(first, vllm.SamplingParams(**{**pinned.ROLLOUT_SAMPLING, "n": 1, "max_tokens": 512}))
-            seen = [len(o.outputs[0].token_ids) for o in trial]
+            seen = trainer.trial_generate(first)
             if any(n > by_text[p] for n, p in zip(seen, first)):
                 problems.append(f"vLLM returned {seen} tokens under caps {[by_text[p] for p in first]}")
             print(f"capped vLLM call: token counts {seen} under caps {[by_text[p] for p in first]}")
-            trainer.generated_tokens = 0
+            problems += trainer.backbone_check()   # vLLM serves the pinned backbone (matters most in server mode)
         tokens = None  # counted after training: prompts x GRPO_GENERATIONS plus generated tokens
 
     if problems:
@@ -362,6 +404,7 @@ def main(argv: list[str] | None = None) -> int:
         tokens = {"forward": prompts + trainer.generated_tokens, "generated": trainer.generated_tokens,
                   "note": "generated tokens counted this session (a resumed run counts only its own)"}
         extra_meta.update(sync_checks=trainer.sync_checks, spliced_keys_untouched=sorted(trainer.spliced_keys),
+                          logps_row_chunked_calls=trainer.logps_chunked_calls,
                           replacements={k: v for k, v in trainer.queue.replacements.most_common()})
     events = [json.loads(line).get("monitor", {}).get("events", []) for line in open(log_path, encoding="utf-8")] \
         if log_path.exists() else []

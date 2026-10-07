@@ -1,8 +1,12 @@
 """TRL's GRPOTrainer with the step-5 and plan pins applied. Imported on the GPU machine only (by train.run).
 
-- Per-type caps: in colocate mode every rollout request reaches vLLM with its own SamplingParams, built whole from
-  ROLLOUT_SAMPLING, the row's max_completion_tokens, both stop tokens and watermarking off, so nothing is left to TRL's,
-  vLLM's or Qwen's defaults. TRL's own params are checked against the pins first.
+- vLLM runs in one of two modes (pinned.GRPO_VLLM_MODE): "colocate", inside the training process on the same GPU, or
+  "server", a `trl vllm-serve` process on a second GPU that the trainer reaches through TRL's VLLMClient.
+- Per-type caps. Colocate: every rollout request reaches vLLM with its own SamplingParams, built whole from
+  ROLLOUT_SAMPLING, the row's max_completion_tokens, both stop tokens and watermarking off. Server: TRL's client sends one
+  max_tokens per call, so each batch is split into one call per cap and the replies are put back in order; the stop
+  tokens go in generation_kwargs where the client takes them. Either way TRL's sampling values are checked against the
+  pins first.
 - Dynamic sampling (types banded "dynamic_sampling" at step 5): after a generation batch is scored, every tied group
   of those types is replaced by a group for the next prompt of the same type (grpo_logic.TypeQueue), generated and
   scored the same way, and spliced in; a tied replacement is kept.
@@ -18,6 +22,8 @@ stops at construction and lists what this TRL has instead, so no hook can be sil
 """
 
 from __future__ import annotations
+
+import inspect
 
 from etl import pinned
 
@@ -57,6 +63,21 @@ def splice(torch, out: dict, new: dict, replaced: list[int], size: int, pad_id: 
     return untouched
 
 
+def join_rows(torch, parts: list[tuple]) -> tuple:
+    """Join per-chunk results of _get_per_token_logps_and_entropies, (log-probs, entropies, aux loss), along the row
+    dimension. A position that is None in every chunk stays None; a per-batch scalar (the MoE aux loss) cannot be
+    split by rows and stops the run."""
+    out = []
+    for values in zip(*parts, strict=True):
+        if all(v is None for v in values):
+            out.append(None)
+        elif all(torch.is_tensor(v) and v.dim() >= 1 for v in values):
+            out.append(torch.cat(values, dim=0))
+        else:
+            raise SystemExit("a log-prob scoring result is not per-row; it cannot be computed in row chunks")
+    return tuple(out)
+
+
 def trainer_class(trl, torch, vllm, sampling_kwargs, field_names):
     """The subclass, built against the imported libraries."""
 
@@ -72,16 +93,34 @@ def trainer_class(trl, torch, vllm, sampling_kwargs, field_names):
             self.spliced_keys: set[str] = set()
             self.sync_checks: list[dict] = []
             self.generated_tokens = 0
+            self.logps_chunked_calls = 0
+            if not callable(getattr(trl.GRPOTrainer, "_get_per_token_logps_and_entropies", None)):
+                raise SystemExit("this TRL's GRPOTrainer has no _get_per_token_logps_and_entropies, which the row-chunked "
+                                 "log-prob scoring overrides; methods with 'logp' in their name: "
+                                 f"{grpo_logic.names_like(self, ('logp',))}")
             if not callable(getattr(trl.GRPOTrainer, "_generate_and_score_completions", None)):
                 raise SystemExit("this TRL's GRPOTrainer has no _generate_and_score_completions (dynamic sampling and the "
                                  f"monitor hook it); generation-related methods: {grpo_logic.names_like(self, ('generat',))}")
-            found = grpo_logic.find_instances(self, vllm.LLM)
+            self.vllm_mode = getattr(self.args, "vllm_mode", "colocate")
+            target = vllm.LLM if self.vllm_mode == "colocate" else grpo_logic.is_vllm_client
+            found = grpo_logic.find_instances(self, target)
             if len(found) != 1:
-                raise SystemExit(f"expected one vLLM engine on the trainer (colocate mode), found {[p for p, _ in found]}; "
-                                 f"vLLM-related attributes: {grpo_logic.names_like(self, ('vllm', 'llm'))}")
-            self.vllm_path, self.vllm_llm = found[0]
-            self.raw_generate = self.vllm_llm.generate
-            self.vllm_llm.generate = self.capped_generate
+                raise SystemExit(f"expected one {'vLLM engine' if self.vllm_mode == 'colocate' else 'VLLMClient'} on the "
+                                 f"trainer ({self.vllm_mode} mode), found {[p for p, _ in found]}; vLLM-related attributes: "
+                                 f"{grpo_logic.names_like(self, ('vllm', 'llm'))}")
+            self.vllm_path, engine = found[0]
+            if self.vllm_mode == "colocate":
+                self.vllm_llm = engine
+                self.raw_generate = engine.generate
+                engine.generate = self.capped_generate
+            else:
+                self.vllm_client = engine
+                self.raw_client_generate = engine.generate
+                self.client_sig = inspect.signature(engine.generate)
+                if "prompts" not in self.client_sig.parameters or "max_tokens" not in self.client_sig.parameters:
+                    raise SystemExit(f"this TRL's VLLMClient.generate takes {list(self.client_sig.parameters)}; "
+                                     "the per-type caps need its prompts and max_tokens")
+                engine.generate = self.capped_client_generate
             holder_path = grpo_logic.parent_path(self.vllm_path)
             owners = [("trainer", self)] + ([(holder_path, grpo_logic.resolve(self, holder_path))] if holder_path else [])
             hook = grpo_logic.find_method(owners, grpo_logic.SYNC_METHODS)
@@ -121,6 +160,51 @@ def trainer_class(trl, torch, vllm, sampling_kwargs, field_names):
             self.generated_tokens += sum(len(c.token_ids) for o in outs for c in o.outputs)
             return outs
 
+        def client_call(self, **values):
+            """Call the server client with the arguments its signature has (and only those)."""
+            params = self.client_sig.parameters
+            out = {k: v for k, v in values.items() if k in params}
+            var_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+            if var_kw:
+                out.update({k: v for k, v in values.items() if k not in params})
+            if "generation_kwargs" in params:
+                out["generation_kwargs"] = {**(values.get("generation_kwargs") or {}), "stop_token_ids": list(self.stop_ids)}
+            return self.raw_client_generate(**out)
+
+        def capped_client_generate(self, *args, **kwargs):
+            bound = self.client_sig.bind(*args, **kwargs)
+            bound.apply_defaults()
+            values = {}
+            for name, value in bound.arguments.items():
+                if self.client_sig.parameters[name].kind is inspect.Parameter.VAR_KEYWORD:
+                    values.update(value)
+                else:
+                    values[name] = value
+            for k in ("temperature", "top_p", "repetition_penalty"):
+                if k in values and values[k] != pinned.ROLLOUT_SAMPLING[k]:
+                    raise SystemExit(f"TRL's rollout {k} is {values[k]}, pinned {pinned.ROLLOUT_SAMPLING[k]}")
+            if values.get("guided_decoding_regex") is not None:
+                raise SystemExit("TRL asked for guided decoding")
+            prompts, n = list(values["prompts"]), values.get("n", 1)
+            parts = []
+            for cap, idx in grpo_logic.group_by_cap([self.caps(p) for p in prompts]):
+                parts.append((idx, self.client_call(**{**values, "prompts": [prompts[i] for i in idx], "max_tokens": cap})))
+            merged = grpo_logic.merge_parts(parts, len(prompts), n)
+            self.generated_tokens += sum(len(c) for c in grpo_logic.completion_ids(merged))
+            return merged
+
+        def trial_generate(self, prompts: list[str]) -> list[int]:
+            """One sampled call through the cap wrapper, asking for 512 tokens; the token counts returned."""
+            if self.vllm_mode == "colocate":
+                outs = self.vllm_llm.generate(prompts, vllm.SamplingParams(**{**pinned.ROLLOUT_SAMPLING, "n": 1, "max_tokens": 512}))
+                counts = [len(o.outputs[0].token_ids) for o in outs]
+            else:
+                kw = {k: v for k, v in {**pinned.ROLLOUT_SAMPLING, "n": 1, "max_tokens": 512}.items()
+                      if k in self.client_sig.parameters}
+                counts = [len(c) for c in grpo_logic.completion_ids(self.vllm_client.generate(prompts=prompts, **kw))]
+            self.generated_tokens = 0
+            return counts
+
         # --- reward, dynamic sampling, monitor ---------------------------------------------------------------
 
         def reward(self, prompts, completions, **kwargs):
@@ -134,6 +218,26 @@ def trainer_class(trl, torch, vllm, sampling_kwargs, field_names):
             if len(self.pending) != 1 or len(self.pending[0]) != len(inputs):
                 raise SystemExit("the reward function was not called once over the whole batch")
             return out, self.pending[0]
+
+        # --- log-prob scoring, in row chunks ---------------------------------------------------------------
+
+        def _get_per_token_logps_and_entropies(self, model, *args, batch_size=None, **kwargs):
+            """TRL 1.14's Liger path ("_chunked_logps") drops batch_size and runs the backbone over every row it is
+            given at once: before training, the whole generation batch (24 prompts x 8 completions, up to ~17k tokens
+            each), which asked for 68 GiB in the pilot. Here the rows go in batches of batch_size (default the
+            micro-batch) and the results are joined. Each row's computation is unchanged."""
+            n = args[0].shape[0]
+            size = batch_size or self.args.per_device_train_batch_size
+            if n <= size:
+                return super()._get_per_token_logps_and_entropies(model, *args, batch_size=batch_size, **kwargs)
+            parts = []
+            for lo, hi in grpo_logic.row_chunks(n, size):
+                def cut(x):
+                    return x[lo:hi] if torch.is_tensor(x) and x.dim() >= 1 and x.shape[0] == n else x
+                parts.append(super()._get_per_token_logps_and_entropies(
+                    model, *[cut(a) for a in args], batch_size=batch_size, **{k: cut(v) for k, v in kwargs.items()}))
+            self.logps_chunked_calls += 1
+            return join_rows(torch, parts)
 
         def _observe(self, inputs, out, vs, group_rows):
             lengths = out["completion_mask"].sum(dim=1).tolist()
@@ -174,32 +278,87 @@ def trainer_class(trl, torch, vllm, sampling_kwargs, field_names):
             if step and step % pinned.MONITOR_EVERY == 0 and all(c["step"] != step for c in self.sync_checks):
                 self.sync_check(step)
 
-        def token_logprobs(self, prompt_ids: list[int], tokens: list[int]) -> list[float]:
+        def token_scores(self, prompt_ids: list[int], tokens: list[int]) -> tuple[list[float], list[int]]:
+            """(log-prob of each token, the argmax at each position), teacher-forced under the trainer's weights."""
             model = self.accelerator.unwrap_model(self.model)
             ids = torch.tensor([prompt_ids + tokens], device=self.accelerator.device)
             logits = model(input_ids=ids).logits[0, len(prompt_ids) - 1:len(prompt_ids) - 1 + len(tokens)].float()
             lp = torch.log_softmax(logits, dim=-1)
-            return lp[torch.arange(len(tokens)), torch.tensor(tokens, device=lp.device)].tolist()
+            return lp[torch.arange(len(tokens)), torch.tensor(tokens, device=lp.device)].tolist(), lp.argmax(dim=-1).tolist()
 
-        def sync_check(self, step: int) -> dict:
-            params = vllm.SamplingParams(**sampling_kwargs({**pinned.EVAL_SAMPLING, "max_tokens": pinned.SYNC_CANARY_TOKENS,
-                                                            "logprobs": 0}, field_names)[0], stop_token_ids=self.stop_ids)
-            outs = self.raw_generate([c["prompt"] for c in self.canary], [params] * len(self.canary))
-            v, cur, start = [], [], []
+        def canary_outputs(self) -> tuple[list[tuple[list[int], list[float] | None]], list | None]:
+            """vLLM's greedy canary continuations: per prompt (tokens, their log-probs or None), stop tokens removed;
+            and the prompt ids the server tokenised, where it says."""
+            prompts = [c["prompt"] for c in self.canary]
+            out, prompt_ids = [], None
+            if self.vllm_mode == "colocate":
+                params = vllm.SamplingParams(**sampling_kwargs({**pinned.EVAL_SAMPLING, "max_tokens": pinned.SYNC_CANARY_TOKENS,
+                                                                "logprobs": 0}, field_names)[0], stop_token_ids=self.stop_ids)
+                for o in self.raw_generate(prompts, [params] * len(prompts)):
+                    c = o.outputs[0]
+                    pairs = [(t, c.logprobs[i][t].logprob) for i, t in enumerate(c.token_ids) if t not in self.stop_ids]
+                    out.append(([t for t, _ in pairs], [x for _, x in pairs]))
+                return out, prompt_ids
+            res = self.client_call(prompts=prompts, n=1, temperature=0.0, top_p=1.0, repetition_penalty=1.0,
+                                   max_tokens=pinned.SYNC_CANARY_TOKENS)
+            comps = grpo_logic.completion_ids(res)
+            lps = res.get("logprobs") if isinstance(res, dict) else None
+            prompt_ids = res.get("prompt_ids") if isinstance(res, dict) else None
+            for k, toks in enumerate(comps):
+                lp = lps[k] if lps is not None and len(lps[k]) == len(toks) and all(isinstance(x, float) for x in lps[k]) else None
+                keep = [i for i, t in enumerate(toks) if t not in self.stop_ids]
+                out.append(([toks[i] for i in keep], None if lp is None else [lp[i] for i in keep]))
+            return out, prompt_ids
+
+        def canary_scores(self) -> dict:
+            outs, prompt_ids = self.canary_outputs()
+            v, toks_all, cur, start, am_cur, am_start = [], [], [], [], [], []
             with torch.no_grad():
-                for c, o in zip(self.canary, outs, strict=True):
-                    toks = [t for t in o.outputs[0].token_ids if t not in self.stop_ids]
+                for c, (toks, lps) in zip(self.canary, outs, strict=True):
                     if not toks:
                         continue
-                    v += [o.outputs[0].logprobs[i][t].logprob for i, t in enumerate(toks)]
-                    cur += self.token_logprobs(c["prompt_ids"], toks)
+                    lp_c, a_c = self.token_scores(c["prompt_ids"], toks)
                     with self.accelerator.unwrap_model(self.model).disable_adapter():
-                        start += self.token_logprobs(c["prompt_ids"], toks)
-            gap_cur, gap_start = grpo_logic.mean_abs_gap(v, cur), grpo_logic.mean_abs_gap(v, start)
-            drift = grpo_logic.mean_abs_gap(cur, start)
-            ok, reason = grpo_logic.sync_verdict(gap_cur, gap_start, drift)
-            record = {"step": step, "gap_current": gap_cur, "gap_start": gap_start, "drift": drift, "ok": ok,
-                      "reason": reason, "tokens": len(v)}
+                        lp_s, a_s = self.token_scores(c["prompt_ids"], toks)
+                    toks_all += toks
+                    cur, start, am_cur, am_start = cur + lp_c, start + lp_s, am_cur + a_c, am_start + a_s
+                    v = None if v is None or lps is None else v + lps
+            if not toks_all:
+                raise SystemExit("vLLM returned no canary tokens")
+            return {"vllm_logprobs": v, "current": cur, "start": start, "tokens": toks_all,
+                    "agree_current": grpo_logic.agreement(toks_all, am_cur),
+                    "agree_start": grpo_logic.agreement(toks_all, am_start), "server_prompt_ids": prompt_ids}
+
+        def backbone_check(self) -> list[str]:
+            """Before training: vLLM serves the pinned backbone (its greedy canary tokens are the backbone's argmax),
+            and, where the server reports them, it tokenised the canary prompts as we do."""
+            sc = self.canary_scores()
+            problems = []
+            if sc["agree_start"] < pinned.SERVER_BACKBONE_AGREE:
+                problems.append(f"vLLM's greedy tokens are the backbone's argmax only {sc['agree_start']:.3f} of the time "
+                                f"(< {pinned.SERVER_BACKBONE_AGREE}): it is not serving the pinned backbone")
+            if sc["server_prompt_ids"] is not None and [list(x) for x in sc["server_prompt_ids"]] != [c["prompt_ids"] for c in self.canary]:
+                problems.append("the vLLM server tokenised the canary prompts differently from the pinned tokenizer")
+            self.write_log({"backbone_check": {"agree": sc["agree_start"], "tokens": len(sc["tokens"]),
+                                               "server_prompt_ids_reported": sc["server_prompt_ids"] is not None,
+                                               "problems": problems}})
+            return problems
+
+        def sync_check(self, step: int) -> dict:
+            sc = self.canary_scores()
+            drift = grpo_logic.mean_abs_gap(sc["current"], sc["start"])
+            if sc["vllm_logprobs"] is not None:
+                gap_cur = grpo_logic.mean_abs_gap(sc["vllm_logprobs"], sc["current"])
+                gap_start = grpo_logic.mean_abs_gap(sc["vllm_logprobs"], sc["start"])
+                ok, reason = grpo_logic.sync_verdict(gap_cur, gap_start, drift)
+                method = "log-probs"
+            else:
+                gap_cur = gap_start = None
+                ok, reason = grpo_logic.sync_verdict_argmax(sc["agree_current"], sc["agree_start"])
+                method = "greedy choices"
+            record = {"step": step, "method": method, "gap_current": gap_cur, "gap_start": gap_start, "drift": drift,
+                      "agree_current": sc["agree_current"], "agree_start": sc["agree_start"], "ok": ok,
+                      "reason": reason, "tokens": len(sc["tokens"])}
             self.sync_checks.append(record)
             self.write_log({"sync_check": record})
             if ok is False:

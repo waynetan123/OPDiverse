@@ -38,9 +38,11 @@ def rewards(vs: list[verifiers.Verdict]) -> list[float]:
 SYNC_METHODS = ("_move_model_to_vllm", "sync_weights", "_sync_weights", "update_vllm_weights", "load_weights")
 
 
-def find_instances(root, cls, depth: int = 2) -> list[tuple[str, object]]:
-    """(attribute path, object) for every instance of `cls` reachable from `root` through at most `depth` plain
-    attributes (instance __dict__ only, so no property runs), each object once, shortest path first."""
+def find_instances(root, match, depth: int = 2) -> list[tuple[str, object]]:
+    """(attribute path, object) for every object reachable from `root` through at most `depth` plain attributes
+    (instance __dict__ only, so no property runs) that is an instance of `match` (a class) or satisfies it (a
+    predicate), each object once, shortest path first."""
+    test = match if not isinstance(match, type) else (lambda v: isinstance(v, match))
     found, seen = [], {id(root)}
     level = [("", root)]
     for _ in range(depth):
@@ -51,7 +53,7 @@ def find_instances(root, cls, depth: int = 2) -> list[tuple[str, object]]:
                     continue
                 seen.add(id(value))
                 p = f"{path}.{name}" if path else name
-                if isinstance(value, cls):
+                if test(value):
                     found.append((p, value))
                 else:
                     nxt.append((p, value))
@@ -79,9 +81,21 @@ def find_method(owners: list[tuple[str, object]], names: tuple[str, ...]) -> tup
     return None
 
 
+def is_vllm_client(value) -> bool:
+    """TRL's client for a `trl vllm-serve` server (server mode), whatever module this TRL keeps it in."""
+    return type(value).__name__ == "VLLMClient"
+
+
 def names_like(obj, words: tuple[str, ...]) -> list[str]:
     """Attribute names on obj (class and instance) containing any of `words`, for an error that says where to look."""
     return sorted({n for n in dir(obj) if any(w in n.lower() for w in words)})
+
+
+def row_chunks(n: int, size: int) -> list[tuple[int, int]]:
+    """[lo, hi) row ranges of at most `size` rows covering 0..n, in order."""
+    if n < 0 or size < 1:
+        raise ValueError(f"cannot split {n} rows into chunks of {size}")
+    return [(lo, min(lo + size, n)) for lo in range(0, n, size)]
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +123,52 @@ class CapLookup:
         if key not in table:
             raise SystemExit("a rollout prompt is not a training prompt of this run; its cap is unknown")
         return table[key]
+
+
+def group_by_cap(caps: list[int]) -> list[tuple[int, list[int]]]:
+    """Prompt positions grouped by their cap, smallest cap first: one server request per group."""
+    groups: dict[int, list[int]] = defaultdict(list)
+    for i, c in enumerate(caps):
+        groups[c].append(i)
+    return sorted(groups.items())
+
+
+def completion_ids(result) -> list:
+    """A server reply's completions: the reply itself in older TRL (a list), its "completion_ids" in newer (a dict)."""
+    return result if isinstance(result, list) else result["completion_ids"]
+
+
+def merge_parts(parts: list[tuple[list[int], object]], n_prompts: int, n: int):
+    """Put per-cap-group server replies back in the original prompt order. A reply is a list of completions (older
+    TRL) or a dict of lists, each either per completion (n per prompt, prompt-major) or per prompt."""
+    lists = [p if isinstance(p, list) else None for _, p in parts]
+    keys = None if all(x is not None for x in lists) else sorted(parts[0][1])
+    if keys is not None and any(isinstance(p, list) or sorted(p) != keys for _, p in parts):
+        raise SystemExit("the vLLM server's replies differ in form between cap groups")
+
+    def merge(get) -> list:
+        per_completion: list = [None] * (n_prompts * n)
+        per_prompt: list = [None] * n_prompts
+        kinds = set()
+        for idx, part in parts:
+            values = get(part)
+            if len(values) == len(idx) * n:
+                kinds.add("completion")
+                for j, i in enumerate(idx):
+                    per_completion[i * n:(i + 1) * n] = values[j * n:(j + 1) * n]
+            elif len(values) == len(idx):
+                kinds.add("prompt")
+                for j, i in enumerate(idx):
+                    per_prompt[i] = values[j]
+            else:
+                raise SystemExit(f"a vLLM server reply field has {len(values)} entries for {len(idx)} prompts x {n}")
+        if len(kinds) != 1:
+            raise SystemExit("a vLLM server reply field is per completion in one cap group and per prompt in another")
+        return per_completion if kinds == {"completion"} else per_prompt
+
+    if keys is None:
+        return merge(lambda p: p)
+    return {k: merge(lambda p, k=k: p[k]) for k in keys}
 
 
 def sampling_fields(cap: int, n: int, logprobs) -> dict:
@@ -245,6 +305,21 @@ class Monitor:
 # ---------------------------------------------------------------------------
 # Weight sync
 # ---------------------------------------------------------------------------
+
+
+def agreement(tokens: list[int], argmax: list[int]) -> float:
+    return sum(t == a for t, a in zip(tokens, argmax, strict=True)) / len(tokens)
+
+
+def sync_verdict_argmax(agree_current: float, agree_start: float) -> tuple[bool | None, str]:
+    """The greedy-choice form of the check, for a server that returns no log-probs: (ok, reason)."""
+    if min(agree_current, agree_start) > 1 - pinned.SYNC_MIN_FLIP:
+        return None, (f"greedy choices agree with both the current ({agree_current:.3f}) and the starting weights "
+                      f"({agree_start:.3f}): too early to tell")
+    if agree_current > agree_start:
+        return True, f"vLLM's greedy choices match the current weights ({agree_current:.3f}) over the start ({agree_start:.3f})"
+    return False, (f"vLLM's greedy choices match the starting weights ({agree_start:.3f}) at least as well as the current "
+                   f"ones ({agree_current:.3f}): rollouts are not coming from the current weights")
 
 
 def mean_abs_gap(a: list[float], b: list[float]) -> float:

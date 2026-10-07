@@ -441,3 +441,85 @@ def test_find_trl_internals_wherever_they_live():
     shared = LLM()                                      # one engine reachable two ways is one engine
     both = SimpleNamespace(a=shared, b=SimpleNamespace(c=shared))
     assert len(grpo_logic.find_instances(both, LLM)) == 1
+
+
+def test_server_replies_split_by_cap_and_put_back_in_order():
+    caps = [16, 512, 16, 256]
+    groups = grpo_logic.group_by_cap(caps)
+    assert groups == [(16, [0, 2]), (256, [3]), (512, [1])]
+    n = 2
+    # each "server" reply: completions named by original prompt, prompt-major; prompt_ids per prompt
+    replies = {cap: {"completion_ids": [[i, j] for i in idx for j in range(n)], "prompt_ids": [[i] for i in idx]}
+               for cap, idx in groups}
+    merged = grpo_logic.merge_parts([(idx, replies[cap]) for cap, idx in groups], len(caps), n)
+    assert merged["completion_ids"] == [[i, j] for i in range(4) for j in range(n)]
+    assert merged["prompt_ids"] == [[0], [1], [2], [3]]
+    old = grpo_logic.merge_parts([(idx, replies[cap]["completion_ids"]) for cap, idx in groups], len(caps), n)
+    assert old == merged["completion_ids"] and grpo_logic.completion_ids(old) is old
+    with pytest.raises(SystemExit, match="entries"):
+        grpo_logic.merge_parts([([0, 1], {"completion_ids": [[1]] * 3})], 2, n)
+    with pytest.raises(SystemExit, match="differ in form"):
+        grpo_logic.merge_parts([([0], [[1], [1]]), ([1], {"completion_ids": [[1], [1]]})], 2, n)
+
+
+def test_sync_verdict_from_greedy_choices():
+    assert grpo_logic.sync_verdict_argmax(0.99, 0.98)[0] is None         # nothing has moved yet
+    assert grpo_logic.sync_verdict_argmax(0.98, 0.70)[0] is True         # synced: matches the current weights
+    assert grpo_logic.sync_verdict_argmax(0.75, 0.99)[0] is False        # stale: still the starting weights
+    assert grpo_logic.agreement([1, 2, 3, 4], [1, 2, 0, 4]) == 0.75
+
+
+def test_find_server_client_by_name():
+    class VLLMClient:
+        def generate(self, prompts, n=1, max_tokens=16): ...
+
+    trainer = SimpleNamespace(vllm_generation=SimpleNamespace(vllm_client=VLLMClient()))
+    (path, client), = grpo_logic.find_instances(trainer, grpo_logic.is_vllm_client)
+    assert path == "vllm_generation.vllm_client" and isinstance(client, VLLMClient)
+
+
+def test_vllm_mode_and_server_fields(monkeypatch):
+    import dataclasses
+
+    assert run.vllm_mode("grpo", True, None) == "colocate" and run.vllm_mode("grpo", True, "server") == "server"
+    assert run.vllm_mode("sft", False, None) is None
+    with pytest.raises(SystemExit, match="GRPO only"):
+        run.vllm_mode("dpo", True, "server")
+    with pytest.raises(SystemExit, match="pilot runs"):
+        run.vllm_mode("grpo", False, "server")
+    monkeypatch.setattr(pinned, "GRPO_VLLM_MODE", "server")
+    assert run.vllm_mode("grpo", False, None) == "server"
+    monkeypatch.setattr(pinned, "GRPO_VLLM_MODE", None)
+    for name in ("TRAIN_STEPS", "GRADIENT_CHECKPOINTING", "TRAIN_LIBS", "TRL_DEFAULTS"):
+        monkeypatch.setattr(pinned, name, 1)
+    assert run.readiness(False, "grpo") == ["GRPO_VLLM_MODE"] and run.readiness(False, "sft") == []
+
+    @dataclasses.dataclass
+    class HostPort:
+        vllm_server_host: str = "0.0.0.0"
+        vllm_server_port: int = 8000
+        vllm_group_port: int = 51216
+
+    @dataclasses.dataclass
+    class BaseUrl:
+        vllm_server_base_url: str | None = None
+        vllm_group_port: int = 51216
+
+    @dataclasses.dataclass
+    class Neither:
+        vllm_mode: str = "colocate"
+
+    assert run.server_fields(HostPort, "127.0.0.1", 8001, 51217) == {
+        "vllm_server_host": "127.0.0.1", "vllm_server_port": 8001, "vllm_group_port": 51217}
+    assert run.server_fields(BaseUrl, "127.0.0.1", 8001, 51217) == {
+        "vllm_server_base_url": "http://127.0.0.1:8001", "vllm_group_port": 51217}
+    with pytest.raises(SystemExit, match="no server address"):
+        run.server_fields(Neither, "h", 1, 2)
+
+
+def test_row_chunks():
+    assert grpo_logic.row_chunks(192, 1)[:2] == [(0, 1), (1, 2)] and len(grpo_logic.row_chunks(192, 1)) == 192
+    assert grpo_logic.row_chunks(5, 2) == [(0, 2), (2, 4), (4, 5)]
+    assert grpo_logic.row_chunks(0, 4) == []
+    with pytest.raises(ValueError):
+        grpo_logic.row_chunks(5, 0)

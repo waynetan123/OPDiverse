@@ -503,6 +503,17 @@ COLLAPSE_RATE = Fraction(9, 10)  # find_error: one predicted class above this ov
 SYNC_CANARY_TOKENS = 32
 SYNC_MIN_DRIFT = 0.05
 SYNC_RATIO = 0.5
+# Where a vLLM server returns no log-probs, the check reads greedy choices instead: on vLLM's canary tokens, the share
+# that are the argmax under the current weights and under the starting weights. Once either share is at most
+# 1 - SYNC_MIN_FLIP (the policy has moved enough to change greedy choices), vLLM must agree more with the current weights.
+SYNC_MIN_FLIP = 0.1
+# Before training, vLLM's greedy canary tokens must be the backbone's argmax at least this often (bf16 near-ties
+# aside): the server is serving the pinned backbone.
+SERVER_BACKBONE_AGREE = 0.9
+# Where GRPO's vLLM runs (plan: decided by measurement on the pilot): "colocate", on the training GPU, or "server",
+# TRL's `trl vllm-serve` on a second GPU. Set from the pilot; the sweep refuses to run while it is None.
+GRPO_VLLM_MODES = ("colocate", "server")
+GRPO_VLLM_MODE: str | None = None
 # Library versions and the TRL defaults above, recorded by the pilot (as VLLM_VERSION was by the probe).
 TRAIN_LIBS: dict | None = None
 TRL_DEFAULTS: dict | None = None

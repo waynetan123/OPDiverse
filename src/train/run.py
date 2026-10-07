@@ -84,6 +84,18 @@ def label_problems(labels: list[int], position_ids: list[int], expected: list[in
     return [f"labels differ from the loss mask at {len(bad)} positions, e.g. {bad[:5]}"] if bad else []
 
 
+# Arguments that only switch truncation off. Some TRL versions have dropped them (and with them the truncation), so
+# they are passed only where the installed config has them; which were absent is recorded. Every other argument is
+# required: a pinned setting the config lacks fails loudly.
+NO_TRUNCATION = {"max_prompt_length": None, "max_completion_length": None}
+
+
+def optional_fields(config_cls, wanted: dict) -> tuple[dict, list[str]]:
+    """(the `wanted` arguments the config class has, the names it lacks)."""
+    names = {f.name for f in dataclasses.fields(config_cls)}
+    return {k: v for k, v in wanted.items() if k in names}, sorted(k for k in wanted if k not in names)
+
+
 def without_end(text: str, end: str = pinned.COMPLETION_END) -> str:
     if not text.endswith(end):
         raise ValueError("completion does not end in its end token")
@@ -230,13 +242,14 @@ def main(argv: list[str] | None = None) -> int:
     extra_meta: dict = {}
 
     if trainer_kind == "sft":
-        is_base = args.arm == "base"
+        # The labels carry the loss mask (-100 off the loss tokens); TRL uses them as given on a prepared dataset.
         ds = datasets.Dataset.from_list([{"input_ids": list(encoded[k].input_ids),
-                                          "completion_mask": list(encoded[k].loss_mask)} for k in keys])
+                                          "labels": expected_labels(list(encoded[k].input_ids), list(encoded[k].loss_mask))}
+                                         for k in keys])
         targs = trl.SFTConfig(**common, per_device_train_batch_size=args.micro_batch,
                               gradient_accumulation_steps=_accum(pinned.TRAIN_EXAMPLES_PER_STEP, args.micro_batch),
                               max_length=max_length, padding_free=False, packing=False,
-                              completion_only_loss=not is_base, dataset_kwargs={"skip_prepare_dataset": True})
+                              completion_only_loss=False, dataset_kwargs={"skip_prepare_dataset": True})
         Trainer = type("PinnedSFTTrainer", (sequential, trl.SFTTrainer), {})
         trainer = Trainer(model=model, args=targs, train_dataset=ds, processing_class=tokenizer, peft_config=lora,
                           callbacks=callbacks)
@@ -247,11 +260,11 @@ def main(argv: list[str] | None = None) -> int:
                                        expected_labels(list(encoded[k].input_ids), list(encoded[k].loss_mask)))
         tokens = sft_tokens(keys, encoded)
     elif trainer_kind == "dpo":
-        targs = trl.DPOConfig(**common, per_device_train_batch_size=args.micro_batch,
+        opt, extra_meta["truncation_args_absent"] = optional_fields(trl.DPOConfig, NO_TRUNCATION)
+        targs = trl.DPOConfig(**common, **opt, per_device_train_batch_size=args.micro_batch,
                               gradient_accumulation_steps=_accum(pinned.TRAIN_EXAMPLES_PER_STEP, args.micro_batch),
                               beta=pinned.DPO["beta"], loss_type=pinned.DPO["loss_type"], max_length=max_length,
-                              max_prompt_length=None, max_completion_length=None, padding_free=False,
-                              precompute_ref_log_probs=False)
+                              padding_free=False, precompute_ref_log_probs=False)
         Trainer = type("PinnedDPOTrainer", (sequential, trl.DPOTrainer), {})
         problems, trainer, end_form, tried = [], None, None, {}
         for end_form in ("ours", "trl"):   # does TRL append the end token itself? the reference ids decide
@@ -285,9 +298,10 @@ def main(argv: list[str] | None = None) -> int:
         ds_rows = data.grpo_dataset_rows(order)
         rows_by_item = {r["item_id"]: r for r in data.grpo_dataset_rows(rows)}
         per_step = pinned.TRAIN_EXAMPLES_PER_STEP * pinned.GRPO_GENERATIONS
-        targs = trl.GRPOConfig(**common, **pinned.GRPO, per_device_train_batch_size=args.micro_batch,
+        opt, extra_meta["truncation_args_absent"] = optional_fields(trl.GRPOConfig, {"max_prompt_length": None})
+        targs = trl.GRPOConfig(**common, **pinned.GRPO, **opt, per_device_train_batch_size=args.micro_batch,
                                gradient_accumulation_steps=_accum(per_step, args.micro_batch),
-                               max_prompt_length=None, use_vllm=True, vllm_mode="colocate",
+                               use_vllm=True, vllm_mode="colocate",
                                vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
                                vllm_max_model_length=pinned.EVAL_MAX_MODEL_LEN)
         holder: dict = {}

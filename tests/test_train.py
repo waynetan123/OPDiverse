@@ -301,6 +301,22 @@ def test_label_checks():
         run.without_end("ANSWER: B")
 
 
+def test_optional_truncation_fields():
+    import dataclasses
+
+    @dataclasses.dataclass
+    class Old:
+        max_prompt_length: int | None = 512
+        beta: float = 0.1
+
+    @dataclasses.dataclass
+    class New:
+        beta: float = 0.1
+
+    assert run.optional_fields(Old, run.NO_TRUNCATION) == ({"max_prompt_length": None}, ["max_completion_length"])
+    assert run.optional_fields(New, {"max_prompt_length": None}) == ({}, ["max_prompt_length"])
+
+
 def test_readiness_and_versions(monkeypatch):
     for name in ("TRAIN_STEPS", "GRADIENT_CHECKPOINTING", "TRAIN_LIBS", "TRL_DEFAULTS"):
         monkeypatch.setattr(pinned, name, None)

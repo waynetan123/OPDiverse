@@ -91,6 +91,14 @@ def names_like(obj, words: tuple[str, ...]) -> list[str]:
     return sorted({n for n in dir(obj) if any(w in n.lower() for w in words)})
 
 
+def trim_start(any_real: list[bool], keep: int) -> int:
+    """How many leading columns of a left-padded batch are padding in every row: the first column where any row has a
+    real token, never cutting into the last `keep` columns (the completion). Cutting them changes no token's
+    attention: padding is masked, and rotary positions only enter through distances between tokens."""
+    first = next((i for i, a in enumerate(any_real) if a), len(any_real))
+    return max(0, min(first, len(any_real) - keep))
+
+
 def row_chunks(n: int, size: int) -> list[tuple[int, int]]:
     """[lo, hi) row ranges of at most `size` rows covering 0..n, in order."""
     if n < 0 or size < 1:

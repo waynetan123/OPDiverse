@@ -530,3 +530,11 @@ def test_one_gpu_per_run():
     assert "sees 4 GPUs" in run.gpu_problem(4, None) and "not set" in run.gpu_problem(4, None)
     assert "'0,1'" in run.gpu_problem(2, "0,1") and "vllm-serve" in run.gpu_problem(2, "0,1")
     assert "sees 0 GPUs" in run.gpu_problem(0, "")
+
+
+def test_trim_start_cuts_only_shared_left_padding():
+    # columns: 4 of padding for every row, then real tokens; the last 3 columns are the completion
+    assert grpo_logic.trim_start([False] * 4 + [True] * 6, 3) == 4
+    assert grpo_logic.trim_start([True] * 10, 3) == 0                    # nothing shared to cut
+    assert grpo_logic.trim_start([False] * 9 + [True], 3) == 7           # never into the completion columns
+    assert grpo_logic.trim_start([False] * 5, 2) == 3

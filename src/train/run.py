@@ -419,6 +419,7 @@ def main(argv: list[str] | None = None) -> int:
                   "note": "generated tokens counted this session (a resumed run counts only its own)"}
         extra_meta.update(sync_checks=trainer.sync_checks, spliced_keys_untouched=sorted(trainer.spliced_keys),
                           logps_row_chunked_calls=trainer.logps_chunked_calls,
+                          padding_columns_cut={"cut": trainer.padding_columns[0], "of": trainer.padding_columns[1]},
                           replacements={k: v for k, v in trainer.queue.replacements.most_common()})
     events = [json.loads(line).get("monitor", {}).get("events", []) for line in open(log_path, encoding="utf-8")] \
         if log_path.exists() else []

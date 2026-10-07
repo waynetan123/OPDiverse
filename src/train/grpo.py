@@ -94,6 +94,7 @@ def trainer_class(trl, torch, vllm, sampling_kwargs, field_names):
             self.sync_checks: list[dict] = []
             self.generated_tokens = 0
             self.logps_chunked_calls = 0
+            self.padding_columns = [0, 0]   # (padding columns cut, all columns), summed over rows
             if not callable(getattr(trl.GRPOTrainer, "_get_per_token_logps_and_entropies", None)):
                 raise SystemExit("this TRL's GRPOTrainer has no _get_per_token_logps_and_entropies, which the row-chunked "
                                  "log-prob scoring overrides; methods with 'logp' in their name: "
@@ -229,15 +230,38 @@ def trainer_class(trl, torch, vllm, sampling_kwargs, field_names):
             n = args[0].shape[0]
             size = batch_size or self.args.per_device_train_batch_size
             if n <= size:
-                return super()._get_per_token_logps_and_entropies(model, *args, batch_size=batch_size, **kwargs)
+                return super()._get_per_token_logps_and_entropies(model, *self.unpadded(args, kwargs),
+                                                                  batch_size=batch_size, **kwargs)
             parts = []
             for lo, hi in grpo_logic.row_chunks(n, size):
                 def cut(x):
                     return x[lo:hi] if torch.is_tensor(x) and x.dim() >= 1 and x.shape[0] == n else x
-                parts.append(super()._get_per_token_logps_and_entropies(
-                    model, *[cut(a) for a in args], batch_size=batch_size, **{k: cut(v) for k, v in kwargs.items()}))
+                rows = [cut(a) for a in args]
+                rest = {k: cut(v) for k, v in kwargs.items()}
+                parts.append(super()._get_per_token_logps_and_entropies(model, *self.unpadded(rows, rest),
+                                                                        batch_size=batch_size, **rest))
             self.logps_chunked_calls += 1
             return join_rows(torch, parts)
+
+        def unpadded(self, args, kwargs) -> list:
+            """(input_ids, attention_mask, ...) with the leading columns that are padding in every row cut off.
+
+            TRL left-pads every prompt of a generation batch to the longest one: in run order a step mixes ~16k-token
+            code prompts with ~130-token label prompts, so a micro-batch of one short row was ~16k columns of which
+            ~99% padding (step 1 of the cost pilot took 29 minutes). Cutting them changes no token's attention, since
+            padding is masked and rotary positions only enter through distances. A micro-batch-1 row then starts at
+            position 0, as vLLM placed it when it sampled the row."""
+            args = list(args)
+            if len(args) < 2 or not torch.is_tensor(args[1]) or any(torch.is_tensor(v) for v in kwargs.values()):
+                return args   # not (input_ids, attention_mask, ...), or extra per-column inputs: leave as given
+            keep = args[2] if len(args) > 2 else kwargs.get("logits_to_keep")
+            width = args[1].shape[1]
+            start = grpo_logic.trim_start(args[1].bool().any(dim=0).tolist(), int(keep) if keep is not None else width)
+            self.padding_columns[0] += start * args[1].shape[0]
+            self.padding_columns[1] += width * args[1].shape[0]
+            if start:
+                args[0], args[1] = args[0][:, start:], args[1][:, start:]
+            return args
 
         def _observe(self, inputs, out, vs, group_rows):
             lengths = out["completion_mask"].sum(dim=1).tolist()

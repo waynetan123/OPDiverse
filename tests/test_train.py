@@ -523,3 +523,10 @@ def test_row_chunks():
     assert grpo_logic.row_chunks(0, 4) == []
     with pytest.raises(ValueError):
         grpo_logic.row_chunks(5, 0)
+
+
+def test_one_gpu_per_run():
+    assert run.gpu_problem(1, "2") is None
+    assert "sees 4 GPUs" in run.gpu_problem(4, None) and "not set" in run.gpu_problem(4, None)
+    assert "'0,1'" in run.gpu_problem(2, "0,1") and "vllm-serve" in run.gpu_problem(2, "0,1")
+    assert "sees 0 GPUs" in run.gpu_problem(0, "")

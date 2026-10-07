@@ -26,6 +26,7 @@ import argparse
 import dataclasses
 import importlib.metadata
 import json
+import os
 import platform
 import time
 from datetime import datetime, timezone
@@ -56,6 +57,16 @@ def installed_versions(names=LIBS) -> dict[str, str | None]:
         except importlib.metadata.PackageNotFoundError:
             out[n] = None
     return out
+
+
+def gpu_problem(count: int, visible: str | None) -> str | None:
+    """One training job per GPU (plan). With more than one GPU visible, transformers' Trainer wraps the model in
+    torch DataParallel and splits every batch across them; with none, there is nothing to train on."""
+    if count == 1:
+        return None
+    seen = f"CUDA_VISIBLE_DEVICES={visible!r}" if visible is not None else "CUDA_VISIBLE_DEVICES is not set"
+    return (f"this process sees {count} GPUs ({seen}); a run trains on exactly one. Start it with "
+            "CUDA_VISIBLE_DEVICES=<one GPU>; in GRPO server mode, `trl vllm-serve` runs on a different GPU in its own process")
 
 
 def readiness(pilot: bool, arm: str | None = None) -> list[str]:
@@ -217,6 +228,9 @@ def main(argv: list[str] | None = None) -> int:
     from frozen_model.run_vllm import _field_names, sampling_kwargs
     from probe.run_vllm import pinned_tokenizer
 
+    problem = gpu_problem(torch.cuda.device_count(), os.environ.get("CUDA_VISIBLE_DEVICES"))
+    if problem:
+        raise SystemExit(problem)
     trl_defaults = {f.name: f.default for f in dataclasses.fields(trl.GRPOConfig) if f.name in pinned.GRPO_RECORDED_DEFAULTS}
     trl_defaults = json.loads(json.dumps(trl_defaults, default=str))
     if pinned.TRL_DEFAULTS is not None and trl_defaults != pinned.TRL_DEFAULTS:

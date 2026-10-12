@@ -538,3 +538,8 @@ def test_trim_start_cuts_only_shared_left_padding():
     assert grpo_logic.trim_start([True] * 10, 3) == 0                    # nothing shared to cut
     assert grpo_logic.trim_start([False] * 9 + [True], 3) == 7           # never into the completion columns
     assert grpo_logic.trim_start([False] * 5, 2) == 3
+
+
+def test_log_record_carries_elapsed_seconds():
+    assert run.log_record(3, {"loss": 0.5}, 12.34567) == {"step": 3, "trainer": {"loss": 0.5}, "elapsed_s": 12.346}
+    assert run.log_record(3, {"loss": 0.5}, None) == {"step": 3, "trainer": {"loss": 0.5}}

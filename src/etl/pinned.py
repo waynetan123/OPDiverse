@@ -529,7 +529,7 @@ SWEEP_CI = Fraction(95, 100)
 SWEEP_BOOTSTRAP = 10_000
 SWEEP_BOOTSTRAP_SEED = 0
 # The outcome: arm -> winning LR (set when step 10 is recorded).
-SWEEP_LR: dict | None = None
+SWEEP_LR: dict | None = {a: 5e-5 for a in SWEEP_ARMS}
 
 # ---------------------------------------------------------------------------
 # The one-day run (docs/OPDiverse_short.md)

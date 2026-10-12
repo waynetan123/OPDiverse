@@ -66,13 +66,19 @@ def load_generations(requests_path: Path, generations_path: Path) -> tuple[list[
     return requests, rows
 
 
-def evaluate(requests_path: Path, generations_path: Path, by_id: dict[str, dict], graph,
-             types: tuple[str, ...] = pinned.BANK_TYPES) -> Evaluation:
+def verdicts(requests_path: Path, generations_path: Path, by_id: dict[str, dict],
+             graph) -> tuple[list[dict], dict[str, dict], dict[str, verifiers.Verdict]]:
+    """(bank items in request order, item_id -> output, item_id -> verdict) for one checked evaluation."""
     requests, rows = load_generations(requests_path, generations_path)
     items = [by_id[r["item_id"]] for r in requests]
     outs = {i["item_id"]: rows[f"eval:{i['item_id']}"]["outputs"][0] for i in items}
     vs = {i["item_id"]: verifiers.verify_item(i["type"], outs[i["item_id"]]["text"], i["gold"], graph) for i in items}
-    units = {t: u for t, u in unit_scores(vs, items).items() if t in types}
+    return items, outs, vs
+
+
+def type_stats(items: list[dict], outs: dict[str, dict], vs: dict[str, verifiers.Verdict], units: Units,
+               types: tuple[str, ...] = pinned.BANK_TYPES) -> dict[str, dict]:
+    """Per type: the mean per-CVE score, parse, strict and cut-off rates, and mean output tokens."""
     stats = {}
     for t in types:
         chosen = [i["item_id"] for i in items if i["type"] == t]
@@ -83,7 +89,14 @@ def evaluate(requests_path: Path, generations_path: Path, by_id: dict[str, dict]
             "cut_off_rate": sum(outs[i]["finish_reason"] == "length" for i in chosen) / len(chosen),
             "mean_output_tokens": sum(len(outs[i]["token_ids"]) for i in chosen) / len(chosen),
         }
-    return Evaluation(units, stats, file_sha256(generations_path))
+    return stats
+
+
+def evaluate(requests_path: Path, generations_path: Path, by_id: dict[str, dict], graph,
+             types: tuple[str, ...] = pinned.BANK_TYPES) -> Evaluation:
+    items, outs, vs = verdicts(requests_path, generations_path, by_id, graph)
+    units = {t: u for t, u in unit_scores(vs, items).items() if t in types}
+    return Evaluation(units, type_stats(items, outs, vs, units, types), file_sha256(generations_path))
 
 
 # ---------------------------------------------------------------------------

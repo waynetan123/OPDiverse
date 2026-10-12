@@ -137,6 +137,12 @@ def optional_fields(config_cls, wanted: dict) -> tuple[dict, list[str]]:
     return {k: v for k, v in wanted.items() if k in names}, sorted(k for k in wanted if k not in names)
 
 
+def log_record(step: int, logs: dict | None, elapsed: float | None) -> dict:
+    """One train_log.jsonl record: the trainer's logs at a step, and the seconds since this session's training began
+    (short.steps reads seconds per step from it)."""
+    return {"step": step, "trainer": logs, **({} if elapsed is None else {"elapsed_s": round(elapsed, 3)})}
+
+
 def without_end(text: str, end: str = pinned.COMPLETION_END) -> str:
     if not text.endswith(end):
         raise ValueError("completion does not end in its end token")
@@ -488,8 +494,14 @@ def _save_at(transformers, steps: list[int]):
 
 def _jsonl_logger(transformers, write_log):
     class JsonlLogger(transformers.TrainerCallback):
+        t0 = None
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            self.t0 = time.perf_counter()
+
         def on_log(self, args, state, control, logs=None, **kwargs):
-            write_log({"step": state.global_step, "trainer": logs})
+            elapsed = None if self.t0 is None else time.perf_counter() - self.t0
+            write_log(log_record(state.global_step, logs, elapsed))
 
     return JsonlLogger()
 

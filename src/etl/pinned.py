@@ -531,6 +531,29 @@ SWEEP_BOOTSTRAP_SEED = 0
 # The outcome: arm -> winning LR (set when step 10 is recorded).
 SWEEP_LR: dict | None = None
 
+# ---------------------------------------------------------------------------
+# The one-day run (docs/OPDiverse_short.md)
+# ---------------------------------------------------------------------------
+
+# M2 only: the primary arms x the five leave-one-type-out configurations x two seeds, at SWEEP_LR and TRAIN_STEPS,
+# the last checkpoint evaluated on test. If GRPO does not fit, the fallback drops it and the test runs on three arms.
+SHORT_ARMS = PRIMARY_ARMS
+SHORT_FALLBACK_ARMS = ("sft", "distill_self", "dpo")
+SHORT_SEEDS = (0, 1)
+SHORT_GPUS = 4
+# The step-count rule, fixed before the day so the run length depends only on measured cost. From the cost pilot,
+# per arm: t_a the median seconds per step over SHORT_TIMED_STEPS, o_a the rest of the run's time. TRAIN_STEPS is the
+# largest multiple of SHORT_STEP_MULTIPLE, at most SHORT_MAX_STEPS, such that the total work fits on SHORT_GPUS GPUs
+# and the busiest GPU (three GRPO runs) fits, each within the hours left less SHORT_RESERVE_HOURS; every run adds
+# SHORT_EVAL_HOURS for its merge and test evaluation. Below SHORT_MIN_STEPS, or with no GRPO cost run (GRPO did not
+# fit in colocate mode), GRPO is dropped and the rule is applied to the other three arms.
+SHORT_TIMED_STEPS = (3, 10)
+SHORT_EVAL_HOURS = Fraction(1, 4)
+SHORT_RESERVE_HOURS = 3
+SHORT_STEP_MULTIPLE = 4
+SHORT_MAX_STEPS = 399
+SHORT_MIN_STEPS = 48
+
 # Deprecated CWE-1000 weaknesses -> replacement, read from each entry's Description in the
 # 4.20 XML. A replacement is recorded only where MITRE names exactly one successor; None
 # means the row is dropped. Keys must cover every deprecated weakness in the release.

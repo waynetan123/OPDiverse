@@ -24,6 +24,7 @@ stops at construction and lists what this TRL has instead, so no hook can be sil
 from __future__ import annotations
 
 import inspect
+import time
 
 from etl import pinned
 
@@ -93,6 +94,7 @@ def trainer_class(trl, torch, vllm, sampling_kwargs, field_names):
             self.spliced_keys: set[str] = set()
             self.sync_checks: list[dict] = []
             self.generated_tokens = 0
+            self.generate_seconds = 0.0
             self.logps_chunked_calls = 0
             self.padding_columns = [0, 0]   # (padding columns cut, all columns), summed over rows
             if not callable(getattr(trl.GRPOTrainer, "_get_per_token_logps_and_entropies", None)):
@@ -157,7 +159,9 @@ def trainer_class(trl, torch, vllm, sampling_kwargs, field_names):
             params = [vllm.SamplingParams(**sampling_kwargs(grpo_logic.sampling_fields(self.caps(p), sp.n, sp.logprobs),
                                                             field_names)[0], stop_token_ids=self.stop_ids)
                       for p in prompts]
+            t0 = time.perf_counter()
             outs = self.raw_generate(prompts, params, *args, **kwargs)
+            self.generate_seconds += time.perf_counter() - t0
             self.generated_tokens += sum(len(c.token_ids) for o in outs for c in o.outputs)
             return outs
 
@@ -188,8 +192,10 @@ def trainer_class(trl, torch, vllm, sampling_kwargs, field_names):
                 raise SystemExit("TRL asked for guided decoding")
             prompts, n = list(values["prompts"]), values.get("n", 1)
             parts = []
+            t0 = time.perf_counter()
             for cap, idx in grpo_logic.group_by_cap([self.caps(p) for p in prompts]):
                 parts.append((idx, self.client_call(**{**values, "prompts": [prompts[i] for i in idx], "max_tokens": cap})))
+            self.generate_seconds += time.perf_counter() - t0
             merged = grpo_logic.merge_parts(parts, len(prompts), n)
             self.generated_tokens += sum(len(c) for c in grpo_logic.completion_ids(merged))
             return merged
@@ -275,6 +281,7 @@ def trainer_class(trl, torch, vllm, sampling_kwargs, field_names):
 
         def _generate_and_score_completions(self, inputs):
             size = self.num_generations
+            started, self.generate_seconds = time.perf_counter(), 0.0
             out, vs = self._scored(inputs)
             gs = grpo_logic.groups([x["item_id"] for x in inputs], size)
             types = [inputs[g[0]]["type"] for g in gs]
@@ -292,6 +299,12 @@ def trainer_class(trl, torch, vllm, sampling_kwargs, field_names):
                 self.spliced_keys |= set(splice(torch, out, new, replaced, size, self.processing_class.pad_token_id))
             self.write_log({"dynamic_sampling": {"step": self.state.global_step, "replaced_groups": len(replaced),
                                            "by_type": {t: sum(types[k] == t for k in replaced) for t in self.dynamic_types}}})
+            torch.cuda.synchronize()
+            prepared = time.perf_counter() - started
+            # Where a step's time goes: vLLM generation, then scoring (log-probs, rewards, dynamic sampling). TRL's
+            # step_time for the same step, minus both, is the training (forward and backward over the micro-batches).
+            self.write_log({"phase_seconds": {"step": self.state.global_step, "generate": round(self.generate_seconds, 2),
+                                              "score": round(prepared - self.generate_seconds, 2)}})
             return out
 
         # --- weight sync ------------------------------------------------------------------------------------

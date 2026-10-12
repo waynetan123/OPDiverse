@@ -106,8 +106,8 @@ def max_model_len(requests: list[dict]) -> int:
 # ---------------------------------------------------------------------------
 
 
-def load_bank(paths: Paths) -> tuple[list[dict], str]:
-    """(non-test bank rows, sha256 of bank_nontest.jsonl). Refuses a bank whose inputs have changed."""
+def load_bank(paths: Paths, pool: str = "nontest") -> tuple[list[dict], str]:
+    """(the pool's bank rows, sha256 of bank_<pool>.jsonl). Refuses a bank whose inputs have changed."""
     files = BankFiles.of(paths)
     meta = json.loads(files.meta.read_text(encoding="utf-8"))
     for key, path in (("facts_sha256", paths.facts), ("split_sha256", paths.split)):
@@ -115,7 +115,7 @@ def load_bank(paths: Paths) -> tuple[list[dict], str]:
             raise SystemExit(f"bank_meta.json {key} does not match {path.name}: the bank is not the frozen one")
     if meta["template_version"] != pinned.BANK_TEMPLATE_VERSION:
         raise SystemExit(f"bank template {meta['template_version']} != pinned {pinned.BANK_TEMPLATE_VERSION}")
-    path = files.bank("nontest")
+    path = files.bank(pool)
     return read_jsonl(path), file_sha256(path)
 
 

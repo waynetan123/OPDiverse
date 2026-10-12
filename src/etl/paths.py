@@ -182,5 +182,10 @@ class Paths:
     def sweep(self) -> Path:
         return self.data / "sweep"
 
+    # The one-day run (file names are in short.files)
+    @property
+    def short(self) -> Path:
+        return self.data / "short"
+
 
 DEFAULT = Paths(ROOT / "data")

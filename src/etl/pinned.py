@@ -440,7 +440,8 @@ TRAIN_ORDER_SALT = "train-order"
 # with GRPO_GENERATIONS rollouts). 9,576 / 24 = 399 steps is one pass over a question-arm file. TRAIN_STEPS is
 # pinned by the owner from the pilot's measured GPU-hours (1 or 3 passes); the sweep refuses to run while it is None.
 TRAIN_EXAMPLES_PER_STEP = 24
-TRAIN_STEPS: int | None = None
+# One-day run: S from the cost pilot by the step-count rule (python -m short steps, 22 h left; no fallback).
+TRAIN_STEPS: int | None = 56
 CHECKPOINTS = 4  # at round-half-up(k * TRAIN_STEPS / CHECKPOINTS), k = 1..CHECKPOINTS
 # LoRA, identical for every arm (plan: rank 16 on attention and MLP projections). alpha = r: scale 1; the LR sweep
 # absorbs the scale.
@@ -472,7 +473,9 @@ OPTIMIZER = {
 # Fused linear cross-entropy (logits of a 16k-token row over a 152k vocabulary would not fit), every arm.
 TRAIN_LIGER = True
 # Set from the pilot's memory measurement (the plan's default is off); None until then.
-GRADIENT_CHECKPOINTING: bool | None = None
+# One-day run: on without an off-run (memory pilot peaks: GRPO 38.0 GB, DPO 22.0, distill-self 18.2, SFT 18.2;
+# cost pilot: GRPO 41.2, DPO 27.8, distill-self 21.4, SFT 21.2).
+GRADIENT_CHECKPOINTING: bool | None = True
 # DPO (plan: beta fixed at its published default, TRL's 0.1). pi_ref is the starting checkpoint, adapter disabled.
 DPO = {"beta": 0.1, "loss_type": "sigmoid"}
 # GRPO: what the plan and step 5 pin. Everything else is TRL GRPOConfig's default at the pinned TRL version, read by
@@ -513,10 +516,17 @@ SERVER_BACKBONE_AGREE = 0.9
 # Where GRPO's vLLM runs (plan: decided by measurement on the pilot): "colocate", on the training GPU, or "server",
 # TRL's `trl vllm-serve` on a second GPU. Set from the pilot; the sweep refuses to run while it is None.
 GRPO_VLLM_MODES = ("colocate", "server")
-GRPO_VLLM_MODE: str | None = None
+# One-day run: colocate only; GRPO fit on the memory and cost pilots, and server mode is not measured.
+GRPO_VLLM_MODE: str | None = "colocate"
 # Library versions and the TRL defaults above, recorded by the pilot (as VLLM_VERSION was by the probe).
-TRAIN_LIBS: dict | None = None
-TRL_DEFAULTS: dict | None = None
+TRAIN_LIBS: dict | None = {
+    "accelerate": "1.15.0", "datasets": "5.1.0", "liger_kernel": "0.8.4", "peft": "0.21.2", "torch": "2.13.0",
+    "transformers": "5.17.0", "trl": "1.14.2", "vllm": "0.30.0",
+}
+TRL_DEFAULTS: dict | None = {
+    "beta": 0.0, "epsilon": 0.2, "epsilon_high": None, "importance_sampling_level": "token", "loss_type": "dapo",
+    "min_p": None, "top_k": 0, "vllm_importance_sampling_correction": True,
+}
 # Selection (owner, step 10): the column-standardised mean across types, each type divided by its per-CVE spread:
 # for each evaluation, the ddof-1 SD over CVEs of the per-CVE score (find_error: the paired score); pooled as the
 # root mean of those variances over the scale evaluations (SCALE_ARMS x LR_GRID x CHECKPOINTS, on the checkpoint

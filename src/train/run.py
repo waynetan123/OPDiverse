@@ -457,7 +457,7 @@ def main(argv: list[str] | None = None) -> int:
     meta = {
         "run": name, "pilot": args.pilot, "git": git, "versions": {**versions, "python": platform.python_version(),
                                                                    "cuda": torch.version.cuda},
-        "gpu": torch.cuda.get_device_name(0), "config": cfg, "config_sha256": cfgmod.config_sha(cfg),
+        "gpu": torch.cuda.get_device_name(0), "cuda_alloc_conf": os.environ.get("PYTORCH_CUDA_ALLOC_CONF"), "config": cfg, "config_sha256": cfgmod.config_sha(cfg),
         "trl_grpo_defaults": trl_defaults, "training_file": str(file_path), "training_file_content_sha256": file_sha,
         "tokenizer_sha256": tok_sha, "rows_in_file": len(rows), "passes": data.passes(len(rows), steps),
         "max_length": max_length, "micro_batch": args.micro_batch, "longest_first": args.longest_first, "steps_done": trainer.state.global_step,

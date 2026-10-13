@@ -90,7 +90,7 @@ The primary test then runs on three arms with `--arms sft distill_self dpo`, whi
 
 - Each run saves its 4 snapshots as pinned, at round-half-up(k · S / 4).
 - Only the last snapshot (`checkpoint-S`) is merged and evaluated, on the full test set: 2,058 items, 343 CVEs, all five types.
-- The merged weights (~15 GB) are deleted after evaluation. The adapters stay (~0.5 GB per snapshot, ~80 GB in total).
+- The merged weights (~15 GB) are deleted after evaluation. The adapters stay (~0.16 GB per snapshot); each snapshot's optimizer state (~0.32 GB) is deleted once its run has finished training (see "Changes during the run").
 - The other snapshots can be checked on dev later if more GPU time appears. That would be reported as an addition, not as part of this run.
 - Dev is not used at all on the day.
 
@@ -170,20 +170,21 @@ PYTHONPATH=src python -m train.launch \
 
 ```
 PYTHONPATH=src python -m train.launch --plan data/short/queues.json --gpus 0 1 2 3 --retries 1 \
-    --runner short.job --out-dir data/short/runs
+    --runner short.job --out-dir data/short/runs -- --scratch /dev/shm/opdiverse
 ```
 
 Each run (directory `data/short/runs/<arm>_<config>_s<seed>`) is one `short.job`, which runs:
 
 ```
-CUDA_VISIBLE_DEVICES=<g> PYTHONPATH=src python -m train.run --arm <arm> --lr 5e-5 --config <config> --seed <seed> \
-    --out data/short/runs/<arm>_<config>_s<seed>
+CUDA_VISIBLE_DEVICES=<g> PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=src python -m train.run \
+    --arm <arm> --lr 5e-5 --config <config> --seed <seed> --out data/short/runs/<arm>_<config>_s<seed>
+rm data/short/runs/<arm>_<config>_s<seed>/trainer/checkpoint-*/optimizer.pt     # only once all S steps are done
 CUDA_VISIBLE_DEVICES=<g> PYTHONPATH=src python -m train.merge \
     --adapter data/short/runs/<arm>_<config>_s<seed>/trainer/checkpoint-<S> \
-    --out data/short/runs/<arm>_<config>_s<seed>/final/merged
+    --out /dev/shm/opdiverse/<arm>_<config>_s<seed>/merged
 CUDA_VISIBLE_DEVICES=<g> PYTHONPATH=src python -m evaluate.run_vllm --requests data/short/test_requests.jsonl \
-    --model data/short/runs/<arm>_<config>_s<seed>/final/merged --out data/short/runs/<arm>_<config>_s<seed>/final
-rm -rf data/short/runs/<arm>_<config>_s<seed>/final/merged
+    --model /dev/shm/opdiverse/<arm>_<config>_s<seed>/merged --out data/short/runs/<arm>_<config>_s<seed>/final
+rm -rf /dev/shm/opdiverse/<arm>_<config>_s<seed>/merged    # also if the evaluation fails; merge_meta.json is kept in final/
 ```
 
 While the runs go, watch the monitor events: a type below the 10% live-group floor, or a find-the-error collapse. They flag a run but do not stop it.
@@ -226,3 +227,19 @@ To be recorded in a decision-record entry before any GPU run:
    - gradient checkpointing is on without an off-run;
    - GRPO micro-batch stays at 1;
    - GRPO colocate only, with no server-mode measurement.
+
+## Changes during the run
+
+Recorded before relaunching and before any test output is read. None changes what a run computes.
+
+**First launch.** Only GRPO had started (the queue puts it first), and it failed four ways:
+- `data/short/test_requests.jsonl` had not been copied to gpu17, so two evaluations failed (exact-ID s1, find-the-error s1).
+- Their merged weights stayed on disk and filled it, so two merges failed for lack of space (CVSS s1, line localisation s0). All four had finished training.
+- CVSS s0, exact-ID s0 and find-the-error s0 ran out of GPU memory between steps 15 and 27. Each failed to allocate 596 MiB while PyTorch held 1.17 GiB reserved but free, which is fragmentation. They resume from checkpoint-14.
+- The weight-sync check stopped both MCQ runs: s0 at step 10 (gap ratio 0.52 against the 0.5 limit) and s1 at step 20 (ratio 1.24, vLLM nearer the starting weights). Fifteen checks in six other GRPO runs passed with a verdict (ratios 0.04–0.43), so sync works and these are treated as failed runs. Both are rerun from scratch as the plan's one retry. mcq_s1 is not resumed from checkpoint-14, since that snapshot sits between a passing and a failing check. The failed attempts are kept in `data/short/failed/`. If either rerun fails the check again, the owner decides before scoring.
+
+**Changes (owner):**
+1. **Merged weights in memory.** `short.job --scratch /dev/shm/opdiverse` merges into gpu17's `/dev/shm` (126 GB, in RAM) instead of `final/merged`. The run may use at most 52 GB of disk. The weights are identical, and scoring checks them by sha256, not by path. The merged weights are now deleted whether the evaluation succeeds or fails, so a failure cannot fill the disk again.
+2. **Optimizer states deleted once a run finishes training.** When `run_meta.json` records all `S` steps, `short.job` deletes `optimizer.pt` (~0.32 GB) from each of the run's snapshots. This leaves 33 runs × 4 snapshots at about 21 GB instead of about 66 GB. Every adapter stays, so every snapshot can still be merged and evaluated, but no finished run can be trained further. A run that has not finished keeps its optimizer state to resume from.
+3. **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** (`pinned.SHORT_CUDA_ALLOC_CONF`) for every training stage from the relaunch on. It changes how PyTorch lays out GPU memory, not what is computed. `run_meta.json` now records it as `cuda_alloc_conf`. Runs finished in the first launch ran without it.
+4. **Relaunch with `--retries 0`.** The MCQ reruns are already the one retry, and an out-of-memory run would fail on the same row again. A run that fails is left to the owner.

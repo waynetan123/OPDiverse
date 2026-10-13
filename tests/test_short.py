@@ -185,11 +185,16 @@ def test_queue_leaves_out_evaluated_runs_and_needs_the_pin(short, monkeypatch):
 
 STAGES = {
     "fake_train": '''
-        import argparse, json, sys
+        import argparse, json, os, sys
         from pathlib import Path
         ap = argparse.ArgumentParser(); ap.add_argument("--out"); a, rest = ap.parse_known_args()
-        out = Path(a.out); open(out.parent / "calls", "a").write("train " + " ".join(sys.argv[1:]) + "\\n")
-        (out / "trainer" / "checkpoint-8").mkdir(parents=True, exist_ok=True)
+        out = Path(a.out); open(out.parent / "calls", "a").write(
+            f"train alloc={os.environ.get('PYTORCH_CUDA_ALLOC_CONF')} " + " ".join(sys.argv[1:]) + "\\n")
+        for s in (4, 8):
+            ckpt = out / "trainer" / f"checkpoint-{s}"; ckpt.mkdir(parents=True, exist_ok=True)
+            (ckpt / "adapter_model.safetensors").write_text("a"); (ckpt / "optimizer.pt").write_text("o")
+        if os.environ.get("FAIL_TRAIN"):
+            print("torch.OutOfMemoryError: CUDA out of memory", file=sys.stderr); sys.exit(1)
         (out / "run_meta.json").write_text(json.dumps({"steps_done": 8, "pilot": False}))
     ''',
     "fake_merge": '''
@@ -242,21 +247,35 @@ def test_job_runs_the_stages_in_order_and_cleans_up(stages):
     code, out, calls = run_job(stages, "--gradient-checkpointing", "on")
     assert code == 0 and [c.split()[0] for c in calls] == ["train", "merge", "eval"]
     assert "--config m2-cvss --seed 1" in calls[0] and calls[0].endswith("--gradient-checkpointing on")
+    assert f"alloc={pinned.SHORT_CUDA_ALLOC_CONF} " in calls[0]
     assert calls[1].endswith("trainer/checkpoint-8")
     assert not (out / "final" / "merged").exists() and (out / "final" / "merge_meta.json").exists()
     assert (out / "final" / "test_generations.jsonl").exists()
     assert run_job(stages) == (0, out, [])                          # finished: nothing runs again
 
 
-def test_job_failure_and_resume(stages, monkeypatch):
+def test_job_drops_optimizer_states_only_once_training_finished(stages, monkeypatch):
+    monkeypatch.setenv("FAIL_TRAIN", "1")
+    code, out, calls = run_job(stages)
+    assert code == 1 and [c.split()[0] for c in calls] == ["train"]
+    assert len(list(out.glob("trainer/checkpoint-*/optimizer.pt"))) == 2   # unfinished: kept, to resume from
+    monkeypatch.delenv("FAIL_TRAIN")
+    code, out, calls = run_job(stages)
+    assert code == 0 and not list(out.glob("trainer/checkpoint-*/optimizer.pt"))
+    assert len(list(out.glob("trainer/checkpoint-*/adapter_model.safetensors"))) == 2   # every adapter stays
+
+
+def test_job_merges_into_scratch_and_cleans_up_on_failure(stages, monkeypatch):
+    scratch = stages / "scratch"
     monkeypatch.setenv("FAIL_EVAL", "1")
-    code, out, calls = run_job(stages)
+    code, out, calls = run_job(stages, "--scratch", str(scratch))
     assert code == 3 and [c.split()[0] for c in calls] == ["train", "merge", "eval"]
-    assert (out / "final" / "merged").exists()                      # kept for the rerun
+    assert calls[2] == f"eval {scratch / out.name / 'merged'}" and "--scratch" not in calls[0]   # not train.run's
+    assert not (scratch / out.name / "merged").exists() and not (out / "final" / "merged").exists()   # nothing left
     monkeypatch.delenv("FAIL_EVAL")
-    code, out, calls = run_job(stages)
+    code, out, calls = run_job(stages, "--scratch", str(scratch))
     assert code == 0 and [c.split()[0] for c in calls] == ["merge", "eval"]   # training is not redone
-    assert not (out / "final" / "merged").exists()
+    assert not (scratch / out.name / "merged").exists() and (out / "final" / "merge_meta.json").exists()
     with pytest.raises(SystemExit, match="pilots"):
         run_job(stages, "--pilot")
 

@@ -563,6 +563,9 @@ SHORT_RESERVE_HOURS = 3
 SHORT_STEP_MULTIPLE = 4
 SHORT_MAX_STEPS = 399
 SHORT_MIN_STEPS = 48
+# Set for every training stage of short.job (added after three GRPO runs ran out of memory with 1.17 GiB reserved but
+# free: fragmentation). It changes how PyTorch lays out GPU memory, not what is computed.
+SHORT_CUDA_ALLOC_CONF = "expandable_segments:True"
 
 # Deprecated CWE-1000 weaknesses -> replacement, read from each entry's Description in the
 # 4.20 XML. A replacement is recorded only where MITRE names exactly one successor; None

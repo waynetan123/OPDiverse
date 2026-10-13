@@ -184,7 +184,7 @@ SHARED = textwrap.dedent('''
         ap.add_argument(a)
     a, _ = ap.parse_known_args()
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
-    print("gpu", os.environ["CUDA_VISIBLE_DEVICES"], a.config, a.seed, flush=True)
+    print("gpu", os.environ["CUDA_VISIBLE_DEVICES"], a.config, a.seed, os.environ["MASTER_PORT"], flush=True)
     if a.arm == "grpo":
         time.sleep(2.0)
     if a.arm == "dpo" or (a.arm == "distill_self" and not (out / "failed_once").exists()):
@@ -216,7 +216,7 @@ def test_shared_queue_with_retries(tmp_path, monkeypatch, capsys):
     assert out.count("retried after a failure") == 2
     assert (tmp_path / "logs" / "dpo_m2-line_loc_s0.log").exists() and (tmp_path / "logs" / "dpo_m2-line_loc_s0.retry1.log").exists()
     assert (tmp_path / "runs" / "grpo_m2-cvss_s0" / "run_meta.json").exists()
-    assert (tmp_path / "logs" / "sft_m2-mcq_s1.log").read_text().startswith("gpu 2 m2-mcq 1")
+    assert (tmp_path / "logs" / "sft_m2-mcq_s1.log").read_text().startswith("gpu 2 m2-mcq 1 2970")
 
 
 def test_plan_and_queue_arguments(tmp_path, monkeypatch):
@@ -230,3 +230,28 @@ def test_plan_and_queue_arguments(tmp_path, monkeypatch):
                         (["--queue", "1=sft@5e-5", "--out-root", "a", "--out-dir", "b"], "not both")):
         with pytest.raises(SystemExit, match=match):
             launch.main(args)
+
+
+def test_each_job_gets_its_own_port():
+    ports = [launch.job_port(g, k) for g in "0123" for k in range(40)]
+    assert len(set(ports)) == len(ports) and launch.job_port("0", 0) == 29500 and launch.job_port("3", 2) == 29802
+
+
+def test_error_line_skips_traceback_source():
+    log = ("Traceback (most recent call last):\n  File \"/x/short/job.py\", line 93, in <module>\n"
+           "    raise SystemExit(main())\n  File \"/x/train/run.py\", line 240, in main\n"
+           "torch.distributed.DistNetworkError: The server socket has failed to listen on any local network address. "
+           "port: 29500, useIpv6: false, code: -98, name: EADDRINUSE, message: address already in use\n")
+    assert launch.error_line(log).startswith("torch.distributed.DistNetworkError")
+    assert launch.error_line("    raise SystemExit(main())\nSystemExit: 2\n") == "SystemExit: 2"
+
+
+def test_port_free():
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
+        try:
+            held.bind(("", 0))
+        except PermissionError:
+            pytest.skip("binding to a local port is not allowed here")
+        held.listen()
+        assert not launch.port_free(held.getsockname()[1])

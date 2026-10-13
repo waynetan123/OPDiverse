@@ -42,11 +42,13 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import errno
 import json
 import os
 import re
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -190,6 +192,7 @@ def steps_done(log_lines: list[str]) -> int:
     return best
 
 
+CODE = re.compile(r"(File \"|raise |\^+$|~+$)")  # traceback source lines, which name errors without being one
 NOISE = ("destroy_process_group", "ProcessGroupNCCL", "Backend impl 'liger_kernel.ops.backends._ascend")
 ERROR = re.compile(r"(Error|Exception|SystemExit|Killed|Segmentation fault|out of memory)", re.IGNORECASE)
 
@@ -206,9 +209,32 @@ def error_line(text: str) -> str:
     lines = [s.strip() for s in re.split(r"[\r\n]", text) if s.strip()]
     lines = [s for s in lines if not any(n in s for n in NOISE)]
     for s in reversed(lines):
-        if ERROR.search(s):
-            return re.sub(r"^\[rank\d+\]:\s*", "", s)
+        s = re.sub(r"^\[rank\d+\]:\s*", "", s)
+        if ERROR.search(s) and not CODE.match(s):
+            return s
     return lines[-1] if lines else "(no output)"
+
+
+MASTER_PORT = 29500   # each job's torch.distributed port: MASTER_PORT + PORTS_PER_GPU x GPU + jobs started on that GPU
+PORTS_PER_GPU = 100
+
+
+def job_port(gpu: str, started: int) -> int:
+    """A port no other job of this launch uses: GRPO's colocated vLLM opens a torch.distributed store on
+    MASTER_PORT, and runs started together on one machine would otherwise all ask for the same one. Each job on a
+    GPU gets a fresh port, so a socket left behind by an earlier job there cannot block it either."""
+    return MASTER_PORT + PORTS_PER_GPU * int(gpu) + started % PORTS_PER_GPU
+
+
+def port_free(port: int) -> bool:
+    """Nothing on this machine holds the port (gpu17 is shared: another user's job may). Only "address in use"
+    counts as taken; where binding is not allowed at all, the port cannot be checked and is used as is."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind(("", port))
+        except OSError as e:
+            return e.errno != errno.EADDRINUSE
+    return True
 
 
 def exit_reason(code: int) -> str:
@@ -386,7 +412,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("GPUs already in use: " + "; ".join(f"GPU {g}: {', '.join(p)}" for g, p in busy.items())
                          + ". Stop those processes (or pick other GPUs) first.")
     args.logs.mkdir(parents=True, exist_ok=True)
-    env_base = {**os.environ, "PYTHONPATH": os.environ.get("PYTHONPATH") or "src"}
+    env_base = {**os.environ, "PYTHONPATH": os.environ.get("PYTHONPATH") or "src", "MASTER_ADDR": "127.0.0.1"}
+    started = {g: 0 for g in gpus}
     tty = sys.stdout.isatty()
 
     def start(q: Queue) -> None:
@@ -400,9 +427,14 @@ def main(argv: list[str] | None = None) -> int:
             out = Path("data/sweep") / ("pilot" if "--pilot" in passthrough else "runs") / name
         log = args.logs / log_name(out, attempts[name])
         cmd = [sys.executable, "-m", runner, *job.args, "--out", str(out), *passthrough, *job.extra]
+        for _ in range(PORTS_PER_GPU):                       # this GPU's next port that nothing holds
+            port = job_port(job.gpu, started[job.gpu])
+            started[job.gpu] += 1
+            if port_free(port):
+                break
+        env = {**env_base, "CUDA_VISIBLE_DEVICES": job.gpu, "MASTER_PORT": str(port)}
         f = open(log, "w", encoding="utf-8")
-        proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env={**env_base, "CUDA_VISIBLE_DEVICES": job.gpu},
-                                start_new_session=True)
+        proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env, start_new_session=True)
         f.close()
         q.current = Running(job, name, out, log, proc, time.monotonic(), attempts[name])
 

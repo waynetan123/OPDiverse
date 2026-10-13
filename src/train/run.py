@@ -137,6 +137,28 @@ def optional_fields(config_cls, wanted: dict) -> tuple[dict, list[str]]:
     return {k: v for k, v in wanted.items() if k in names}, sorted(k for k in wanted if k not in names)
 
 
+def stand_in(present: set[str], wanted: str, fallback: tuple[str, ...]) -> str:
+    """`wanted` if the run trains on that type, else the first type of `fallback` it does: an M2 run has no rows of
+    its dropped type, and a check that names that type must use another."""
+    if wanted in present:
+        return wanted
+    try:
+        return next(t for t in fallback if t in present)
+    except StopIteration:
+        raise SystemExit(f"the run trains on none of {(wanted, *fallback)}") from None
+
+
+# GRPO's pre-training checks, as (wanted type, stand-ins in order). The weight-sync canary decodes short prompts
+# (MCQ, CVSS); the cap check wants the smallest and the largest step-5 cap (MCQ 16 ... line localisation), so each
+# stand-in is the next type along the cap ladder.
+CANARY_TYPES = (("mcq", ("exact_id", "find_error", "line_loc")), ("cvss", ("exact_id", "find_error", "line_loc")))
+CAP_CHECK_TYPES = (("mcq", ("exact_id", "cvss", "find_error")), ("line_loc", ("find_error", "cvss", "exact_id")))
+
+
+def check_types(present: set[str], spec: tuple[tuple[str, tuple[str, ...]], ...]) -> list[str]:
+    return [stand_in(present, wanted, fallback) for wanted, fallback in spec]
+
+
 def log_record(step: int, logs: dict | None, elapsed: float | None) -> dict:
     """One train_log.jsonl record: the trainer's logs at a step, and the seconds since this session's training began
     (short.steps reads seconds per step from it)."""
@@ -375,8 +397,11 @@ def main(argv: list[str] | None = None) -> int:
         by_text = {r["prompt"]: r["max_completion_tokens"] for r in rows}
         by_ids = {encoded[data.order_key(r)].prompt_ids: r["max_completion_tokens"] for r in rows}
         dynamic = {r["type"] for r in rows if r["dynamic_sampling"]}
+        present = {r["type"] for r in order}
+        canary_types = check_types(present, CANARY_TYPES)
         canary = [{"prompt": r["prompt"], "prompt_ids": list(encoded[data.order_key(r)].prompt_ids)}
-                  for t in ("mcq", "cvss") for r in [next(x for x in order if x["type"] == t)]]
+                  for t in canary_types for r in [next(x for x in order if x["type"] == t)]]
+        extra_meta["check_types"] = {"canary": canary_types, "cap_check": check_types(present, CAP_CHECK_TYPES)}
         monitor = grpo_logic.Monitor()
         Trainer = trainer_class(trl, torch, vllm, sampling_kwargs, _field_names(vllm.SamplingParams))
         trainer = Trainer(model=model, args=targs, train_dataset=datasets.Dataset.from_list(ds_rows),
@@ -394,8 +419,8 @@ def main(argv: list[str] | None = None) -> int:
         gen_batch = getattr(trainer.args, "generation_batch_size", per_step)
         if gen_batch != per_step:
             problems.append(f"TRL generates {gen_batch} completions per batch, not one optimizer step's {per_step}")
-        if not problems:   # one call through the cap wrapper: an MCQ prompt and a line-localisation prompt
-            first = [next(r["prompt"] for r in ds_rows if r["type"] == t) for t in ("mcq", "line_loc")]
+        if not problems:   # one call through the cap wrapper: an MCQ and a line-localisation prompt, or stand-ins
+            first = [next(r["prompt"] for r in ds_rows if r["type"] == t) for t in extra_meta["check_types"]["cap_check"]]
             seen = trainer.trial_generate(first)
             if any(n > by_text[p] for n, p in zip(seen, first)):
                 problems.append(f"vLLM returned {seen} tokens under caps {[by_text[p] for p in first]}")

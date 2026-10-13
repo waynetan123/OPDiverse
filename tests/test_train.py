@@ -543,3 +543,19 @@ def test_trim_start_cuts_only_shared_left_padding():
 def test_log_record_carries_elapsed_seconds():
     assert run.log_record(3, {"loss": 0.5}, 12.34567) == {"step": 3, "trainer": {"loss": 0.5}, "elapsed_s": 12.346}
     assert run.log_record(3, {"loss": 0.5}, None) == {"step": 3, "trainer": {"loss": 0.5}}
+
+
+def test_check_types_stand_in_for_the_dropped_type():
+    every = set(pinned.BANK_TYPES)
+    assert run.check_types(every, run.CANARY_TYPES) == ["mcq", "cvss"]          # M1: unchanged
+    assert run.check_types(every, run.CAP_CHECK_TYPES) == ["mcq", "line_loc"]
+    for dropped in pinned.BANK_TYPES:                                            # every M2 configuration
+        present = every - {dropped}
+        for spec in (run.CANARY_TYPES, run.CAP_CHECK_TYPES):
+            types = run.check_types(present, spec)
+            assert dropped not in types and len(set(types)) == 2 and set(types) <= present
+    assert run.check_types(every - {"mcq"}, run.CANARY_TYPES) == ["exact_id", "cvss"]
+    assert run.check_types(every - {"cvss"}, run.CANARY_TYPES) == ["mcq", "exact_id"]
+    assert run.check_types(every - {"line_loc"}, run.CAP_CHECK_TYPES) == ["mcq", "find_error"]
+    with pytest.raises(SystemExit, match="none of"):
+        run.stand_in({"mcq"}, "cvss", ("exact_id",))

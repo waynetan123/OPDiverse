@@ -252,3 +252,16 @@ The evidence, from the training logs only:
 
 **Change (owner):**
 5. **The canary runs on an emptied prefix cache.** `sync_check` resets vLLM's prefix cache before the canary that decides. The rule is unchanged: drift above 0.05, then gap_current < 0.5 × gap_start. The same canary also runs first on the cache as the sync left it, and is recorded as `before_cache_reset` beside each check. The check decides on the post-reset canary only. The first record of each run (`vllm_engine`) states whether prefix caching is on. The three runs resume from their latest snapshots (checkpoint-14, -14, -28). The explanation is a hypothesis: if a resumed run fails the check again, it is not resumed a second time, and the primary test runs on the three other arms (`--arms sft distill_self dpo`), with GRPO reported as excluded for failing the weight-sync check.
+
+**Third launch (the cache-reset canary, one GPU).** All three resumed runs failed the check again, with the canary decided on an emptied prefix cache:
+
+| Run | Step | Drift | Ratio before reset | Ratio after reset |
+|---|---|---|---|---|
+| mcq_s0 | 20 | — | — | 1.37 (0.0561 / 0.0409) |
+| mcq_s1 | 20 | 0.122 | 1.26 | 1.26 |
+| line_loc_s1 | 30 | 0.037 | 0.36 | 0.36 (too early to tell) |
+| line_loc_s1 | 40 | 0.066 | 1.01 | 1.01 |
+
+Resetting the cache changed nothing, so the prefix-cache explanation does not hold, and the cause of the gap is not known. TRL's rollout comparison still showed no growing mismatch, but the pre-registered check is what decides.
+
+**Outcome (rule 5, fixed before any test output was read):** GRPO is excluded from the primary test. It failed the weight-sync check in 3 of its 10 M2 runs (m2-mcq seeds 0 and 1, m2-line_loc seed 1), so its column of the matrix is incomplete. The primary test and the MDE run on SFT, distill-self and DPO (`--arms sft distill_self dpo`, 30 runs). The 7 GRPO runs that finished are not part of the result. Whether to report them, and how, is decided after the primary result is recorded.

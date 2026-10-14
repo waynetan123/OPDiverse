@@ -19,11 +19,11 @@ def file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def tree_sha256(root: Path) -> str:
+def tree_sha256(root: Path, exclude: tuple[str, ...] = ()) -> str:
     """sha256 over every file under `root` (relative path and content), in sorted path order: a model directory's
-    identity."""
+    identity. Files at the relative paths in `exclude` are left out."""
     h = hashlib.sha256()
-    for p in sorted(q for q in root.rglob("*") if q.is_file()):
+    for p in sorted(q for q in root.rglob("*") if q.is_file() and str(q.relative_to(root)) not in exclude):
         h.update(str(p.relative_to(root)).encode("utf-8") + b"\0" + file_sha256(p).encode() + b"\0")
     return h.hexdigest()
 

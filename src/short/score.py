@@ -7,7 +7,7 @@
 Each item is scored by its verifier (etl.verifiers.verify_item) and written with its own metric as an exact fraction
 ("3/8"): the analysis pairs the two find-the-error items itself and decides zero-spread columns from exact sums.
 Every run's test generations must come from test_requests.jsonl, through the chain run_meta.json (arm, configuration,
-seed, LR, all TRAIN_STEPS steps) -> its last adapter -> merge_meta.json -> the evaluated weights. m2_scores.jsonl is
+seed, LR, all TRAIN_STEPS steps) -> its last adapter -> merge_meta.json -> the evaluated weights (weights_link). m2_scores.jsonl is
 written only when every run is scored, since the primary test needs the whole matrix; until then the summary lists
 what is missing.
 """
@@ -15,6 +15,7 @@ what is missing.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 from converters import masks
@@ -53,11 +54,30 @@ def check_run(files: ShortFiles, arm: str, config: str, seed: int, steps: int) -
     adapter = Path(merge["adapter"])
     if adapter.name != f"checkpoint-{steps}" or merge["adapter_sha256"] != run["adapters"].get(str(steps)):
         raise SystemExit(f"{name}: the merged adapter {adapter} is not the run's last checkpoint")
-    if ev.get("checkpoint_sha256") != merge["weights_sha256"]:
-        raise SystemExit(f"{name}: the evaluated weights are not the ones merged from the run's last checkpoint")
+    run["weights_link"] = weights_link(ev, merge, name)
     if ev["requests_sha256"] != file_sha256(files.test_requests):
         raise SystemExit(f"{name}: evaluated on a different request file")
     return run
+
+
+def weights_link(ev: dict, merge: dict, name: str) -> str:
+    """How the evaluated weights are tied to the merge of the run's last checkpoint.
+
+    An evaluation that records checkpoint_sha256_excludes hashed the same files as the merge's weights_sha256, so the
+    two must be equal. Earlier evaluations (the one-day run's) also hashed merge_meta.json, which train.merge writes
+    after taking weights_sha256, so the two could never be equal, and the weights were deleted after evaluation. For
+    those, the evaluated directory must be this run's merge output (<run>/final/merged, or <scratch>/<run>/merged
+    under short.job --scratch), and the evaluation must have started after the merge finished."""
+    if "checkpoint_sha256_excludes" in ev:
+        if ev["checkpoint_sha256"] != merge["weights_sha256"]:
+            raise SystemExit(f"{name}: the evaluated weights are not the ones merged from the run's last checkpoint")
+        return "sha256"
+    parts = Path(ev.get("checkpoint", "")).parts
+    if parts[-3:] != (name, "final", "merged") and parts[-2:] != (name, "merged"):
+        raise SystemExit(f"{name}: evaluated {ev.get('checkpoint')}, which is not this run's merge output")
+    if datetime.fromisoformat(ev["last_session_started_utc"]) < datetime.fromisoformat(merge["finished_utc"]):
+        raise SystemExit(f"{name}: the evaluation started before the merge of the run's last checkpoint finished")
+    return "merge output path and order (evaluation predates the sha256 fix)"
 
 
 def score_run(files: ShortFiles, run: tuple[str, str, int], by_id: dict, graph, steps: int) -> tuple[list[dict], dict]:
@@ -72,7 +92,7 @@ def score_run(files: ShortFiles, run: tuple[str, str, int], by_id: dict, graph, 
         "arm": arm, "config": config, "seed": seed, "dropped_type": dropped,
         "types": type_stats(items, outs, vs, unit_scores(vs, items)),
         "generations_sha256": file_sha256(gen),
-        **{k: meta.get(k) for k in ("monitor_events", "gpu_hours", "flops", "tokens", "config_sha256")},
+        **{k: meta.get(k) for k in ("monitor_events", "gpu_hours", "flops", "tokens", "config_sha256", "weights_link")},
     }
     return rows, summary
 

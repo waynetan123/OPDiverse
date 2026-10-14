@@ -21,6 +21,8 @@ from etl.manifest import file_sha256, git_state, tree_sha256
 from etl.paths import ROOT
 
 ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
+# Written into the merged directory after weights_sha256 is taken, so weights_sha256 covers every file but this one.
+MERGE_META = "merge_meta.json"
 
 
 def adapter_sha256(adapter: Path) -> str:
@@ -50,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
     git = git_state(ROOT)
     if git["commit"] is None or git["dirty"]:
         raise SystemExit(f"commit the code and pins before merging (git state: {git})")
-    if (args.out / "merge_meta.json").exists():
+    if (args.out / MERGE_META).exists():
         print(f"{args.out} is already merged")
         return 0
     recorded = run_init(args.adapter)
@@ -77,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
                      "python": platform.python_version()},
         "finished_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    (args.out / "merge_meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (args.out / MERGE_META).write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"merged {args.adapter} -> {args.out} (weights sha256 {meta['weights_sha256'][:12]}…)")
     return 0
 

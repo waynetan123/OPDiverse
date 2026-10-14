@@ -35,6 +35,7 @@ from etl.paths import ROOT
 from frozen_model.run_vllm import CHUNK, DETERMINISM_CHECK, _field_names, file_stats, load_requests, run_file, sampling_kwargs
 from generators.bank.files import generations_for, partial_for, run_meta_for
 from probe.run_vllm import check_rendering, llm_kwargs, pinned_tokenizer
+from train.merge import MERGE_META
 
 JOB = "eval"
 
@@ -131,7 +132,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.check_only:
         return 0
 
-    model_sha = None if args.model is None else tree_sha256(args.model)
+    # The same files as the merge's weights_sha256: merge_meta.json is written after that hash is taken.
+    model_sha = None if args.model is None else tree_sha256(args.model, exclude=(MERGE_META,))
     kwargs, notes = llm_kwargs(_field_names(vllm.EngineArgs), pinned.EVAL_MAX_MODEL_LEN,
                                None if args.model is None else str(args.model))
     for note in notes:
@@ -172,7 +174,8 @@ def main(argv: list[str] | None = None) -> int:
         "model": pinned.TOKENIZER_REPO,
         "revision": pinned.TOKENIZER_REVISION,
         "tokenizer_sha256": tok_sha,
-        **({} if args.model is None else {"checkpoint": str(args.model), "checkpoint_sha256": model_sha}),
+        **({} if args.model is None else {"checkpoint": str(args.model), "checkpoint_sha256": model_sha,
+                                          "checkpoint_sha256_excludes": [MERGE_META]}),
         "llm_kwargs": kwargs,
         "engine_settings": engine_settings(llm),
         "notes": notes + sampling_notes,

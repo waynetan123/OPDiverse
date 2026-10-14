@@ -291,8 +291,9 @@ def changed_vector(vector: str) -> str:
     return "/".join(parts)
 
 
-def fake_run(paths, arm, config, seed, good_cves, partial_cvss=False, requests_sha=None):
-    """run_meta, merge_meta, test_run_meta and generations for one run: gold answers on good_cves, else a non-answer."""
+def fake_run(paths, arm, config, seed, good_cves, partial_cvss=False, requests_sha=None, eval_meta=None):
+    """run_meta, merge_meta, test_run_meta and generations for one run: gold answers on good_cves, else a non-answer.
+    eval_meta replaces the evaluation's weights record (default: the sha256 of the merged weights)."""
     files = ShortFiles.of(paths)
     final = files.final(arm, config, seed)
     final.mkdir(parents=True)
@@ -302,9 +303,11 @@ def fake_run(paths, arm, config, seed, good_cves, partial_cvss=False, requests_s
         if (arm, config, seed) == ("grpo", "m2-line_loc", 0) else [], "gpu_hours": 0.5, "flops": 1.0, "tokens": {},
         "config_sha256": "c" * 64}))
     files.merge_meta(arm, config, seed).write_text(json.dumps({
-        "adapter": str(files.adapter(arm, config, seed, S)), "adapter_sha256": "a" * 64, "weights_sha256": "w" * 64}))
+        "adapter": str(files.adapter(arm, config, seed, S)), "adapter_sha256": "a" * 64, "weights_sha256": "w" * 64,
+        "finished_utc": "2026-10-13T10:00:00+00:00"}))
     sha = hashlib.sha256(files.test_requests.read_bytes()).hexdigest()
-    files.eval_meta(arm, config, seed).write_text(json.dumps({"checkpoint_sha256": "w" * 64, "requests_sha256": sha}))
+    weights = eval_meta or {"checkpoint_sha256": "w" * 64, "checkpoint_sha256_excludes": ["merge_meta.json"]}
+    files.eval_meta(arm, config, seed).write_text(json.dumps({**weights, "requests_sha256": sha}))
     bank, rows = bank_items(paths), []
     for r in read_jsonl(files.test_requests):
         item = bank[r["item_id"]]
@@ -351,6 +354,36 @@ def test_score_refuses_runs_that_do_not_match(short):
     fake_run(short, "dpo", "m2-mcq", 1, cves, requests_sha="0" * 64)
     with pytest.raises(SystemExit, match="was not generated from test_requests.jsonl"):
         score.score(short)
+
+
+def test_the_evaluation_hashes_the_merged_weights_as_the_merge_does(tmp_path):
+    from etl.manifest import tree_sha256
+    from train.merge import MERGE_META
+    merged = tmp_path / "merged"
+    merged.mkdir()
+    (merged / "config.json").write_text("{}")
+    (merged / "model.safetensors").write_bytes(b"weights")
+    at_merge = tree_sha256(merged)                                  # train.merge, before it writes its record
+    (merged / MERGE_META).write_text("{}")
+    assert tree_sha256(merged) != at_merge                          # the one-day run's evaluations: never equal
+    assert tree_sha256(merged, exclude=(MERGE_META,)) == at_merge   # evaluate.run_vllm now
+
+
+def test_score_ties_pre_fix_evaluations_to_the_merge_by_path_and_order(short):
+    cves = cves_of(short)
+    old = {"checkpoint": "/dev/shm/opdiverse/sft_m2-cvss_s0/merged", "checkpoint_sha256": "x" * 64,
+           "last_session_started_utc": "2026-10-13T10:05:00+00:00"}
+    fake_run(short, "sft", "m2-cvss", 0, cves, eval_meta=old)
+    out = score.score(short)
+    assert out["runs"]["sft_m2-cvss_s0"]["weights_link"].startswith("merge output path")
+    files = ShortFiles.of(short)
+    for bad, match in (({**old, "checkpoint": "/dev/shm/opdiverse/sft_m2-cvss_s1/merged"}, "not this run's merge"),
+                       ({**old, "last_session_started_utc": "2026-10-13T09:00:00+00:00"}, "started before the merge"),
+                       ({"checkpoint_sha256": "x" * 64, "checkpoint_sha256_excludes": ["merge_meta.json"]},
+                        "not the ones merged")):
+        files.eval_meta("sft", "m2-cvss", 0).write_text(json.dumps({**bad, "requests_sha256": out["test_requests_sha256"]}))
+        with pytest.raises(SystemExit, match=match):
+            score.score(short)
 
 
 def test_complete_scores_feed_the_frozen_analysis(short, capsys):

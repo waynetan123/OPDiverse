@@ -334,6 +334,23 @@ def mean_abs_gap(a: list[float], b: list[float]) -> float:
     return math.fsum(abs(x - y) for x, y in zip(a, b, strict=True)) / len(a)
 
 
+def sync_numbers(vllm_logprobs: list[float] | None, current: list[float], start: list[float],
+                 agree_current: float, agree_start: float) -> dict:
+    """The weight-sync check on one canary scoring: drift, vLLM's gaps to the current and starting weights, and the
+    verdict (sync_verdict on log-probs; sync_verdict_argmax where vLLM returned none)."""
+    drift = mean_abs_gap(current, start)
+    if vllm_logprobs is not None:
+        gap_current, gap_start = mean_abs_gap(vllm_logprobs, current), mean_abs_gap(vllm_logprobs, start)
+        ok, reason = sync_verdict(gap_current, gap_start, drift)
+        method = "log-probs"
+    else:
+        gap_current = gap_start = None
+        ok, reason = sync_verdict_argmax(agree_current, agree_start)
+        method = "greedy choices"
+    return {"method": method, "gap_current": gap_current, "gap_start": gap_start, "drift": drift,
+            "agree_current": agree_current, "agree_start": agree_start, "ok": ok, "reason": reason}
+
+
 def sync_verdict(gap_current: float, gap_start: float, drift: float) -> tuple[bool | None, str]:
     """(ok, reason). gap_current: vLLM's token logprobs against the trainer's current weights; gap_start: against
     the starting weights; drift: current against start, on vLLM's tokens. Undecidable (None) until the policy has

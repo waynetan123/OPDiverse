@@ -285,6 +285,16 @@ def test_sync_verdict():
     assert grpo_logic.mean_abs_gap([0.0, -1.0], [0.5, -0.5]) == 0.5
 
 
+def test_sync_numbers():
+    current, start = [-0.1, -0.5], [-0.3, -0.7]                                  # drift 0.2
+    synced = grpo_logic.sync_numbers([-0.11, -0.49], current, start, 1.0, 1.0)
+    assert synced["method"] == "log-probs" and synced["ok"] is True and abs(synced["drift"] - 0.2) < 1e-9
+    halfway = grpo_logic.sync_numbers([-0.2, -0.6], current, start, 1.0, 1.0)    # between the two: what a stale cache gives
+    assert halfway["ok"] is False and abs(halfway["gap_current"] - 0.1) < 1e-9 and abs(halfway["gap_start"] - 0.1) < 1e-9
+    greedy = grpo_logic.sync_numbers(None, current, start, 0.98, 0.70)
+    assert greedy["method"] == "greedy choices" and greedy["gap_current"] is None and greedy["ok"] is True
+
+
 def test_splice_puts_replacements_in_place():
     torch = pytest.importorskip("torch")
     from train.grpo import splice

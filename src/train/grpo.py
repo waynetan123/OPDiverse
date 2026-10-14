@@ -11,8 +11,8 @@
   of those types is replaced by a group for the next prompt of the same type (grpo_logic.TypeQueue), generated and
   scored the same way, and spliced in; a tied replacement is kept.
 - The running monitor sees every kept group; train.run writes a summary every MONITOR_EVERY steps.
-- The weight-sync canary runs every MONITOR_EVERY steps after the weights are moved to vLLM (grpo_logic.sync_verdict);
-  a failure stops the run.
+- The weight-sync canary runs every MONITOR_EVERY steps after the weights are moved to vLLM (grpo_logic.sync_verdict),
+  on an emptied vLLM prefix cache; a failure stops the run.
 
 Everything here leans on TRL internals that move between versions: where the vLLM engine is kept, the weight-sync
 method, `_generate_and_score_completions` and its output dict's keys. The engine is found by searching the trainer for
@@ -27,6 +27,7 @@ import inspect
 import time
 
 from etl import pinned
+from evaluate.run_vllm import engine_settings
 
 from . import grpo_logic
 
@@ -116,6 +117,7 @@ def trainer_class(trl, torch, vllm, sampling_kwargs, field_names):
                 self.vllm_llm = engine
                 self.raw_generate = engine.generate
                 engine.generate = self.capped_generate
+                self.write_log({"vllm_engine": engine_settings(engine)})   # prefix caching on or off, among others
             else:
                 self.vllm_client = engine
                 self.raw_client_generate = engine.generate
@@ -381,25 +383,35 @@ def trainer_class(trl, torch, vllm, sampling_kwargs, field_names):
                                                "problems": problems}})
             return problems
 
-        def sync_check(self, step: int) -> dict:
+        def reset_prefix_cache(self) -> None:
+            """Empty vLLM's prefix cache. It keeps the attention vLLM computed over prompts it has already seen, under
+            the weights it had then, and the canary prompts are the same at every check (and are training prompts):
+            a canary that hits that cache is scored partly under earlier weights, which the check cannot tell from a
+            failed sync (one-day run, second relaunch)."""
+            owner = self.vllm_llm if self.vllm_mode == "colocate" else self.vllm_client
+            reset = getattr(owner, "reset_prefix_cache", None)
+            if not callable(reset):
+                raise SystemExit(f"this vLLM {'engine' if self.vllm_mode == 'colocate' else 'client'} has no "
+                                 f"reset_prefix_cache; cache-related: {grpo_logic.names_like(owner, ('cache',))}")
+            if reset() is False:
+                raise SystemExit("vLLM did not reset its prefix cache before the weight-sync canary")
+
+        def canary_numbers(self) -> dict:
             sc = self.canary_scores()
-            drift = grpo_logic.mean_abs_gap(sc["current"], sc["start"])
-            if sc["vllm_logprobs"] is not None:
-                gap_cur = grpo_logic.mean_abs_gap(sc["vllm_logprobs"], sc["current"])
-                gap_start = grpo_logic.mean_abs_gap(sc["vllm_logprobs"], sc["start"])
-                ok, reason = grpo_logic.sync_verdict(gap_cur, gap_start, drift)
-                method = "log-probs"
-            else:
-                gap_cur = gap_start = None
-                ok, reason = grpo_logic.sync_verdict_argmax(sc["agree_current"], sc["agree_start"])
-                method = "greedy choices"
-            record = {"step": step, "method": method, "gap_current": gap_cur, "gap_start": gap_start, "drift": drift,
-                      "agree_current": sc["agree_current"], "agree_start": sc["agree_start"], "ok": ok,
-                      "reason": reason, "tokens": len(sc["tokens"])}
+            return {**grpo_logic.sync_numbers(sc["vllm_logprobs"], sc["current"], sc["start"], sc["agree_current"],
+                                              sc["agree_start"]), "tokens": len(sc["tokens"])}
+
+        def sync_check(self, step: int) -> dict:
+            """The canary on an emptied prefix cache decides. The same canary first runs on the cache as the weight
+            sync left it, and is recorded beside it as a diagnostic (before_cache_reset); it decides nothing."""
+            as_left = self.canary_numbers()
+            self.reset_prefix_cache()
+            record = {"step": step, **self.canary_numbers(),
+                      "before_cache_reset": {k: as_left[k] for k in ("gap_current", "gap_start", "drift", "ok")}}
             self.sync_checks.append(record)
             self.write_log({"sync_check": record})
-            if ok is False:
-                raise SystemExit(f"weight-sync check failed at step {step}: {reason}")
+            if record["ok"] is False:
+                raise SystemExit(f"weight-sync check failed at step {step}: {record['reason']}")
             return record
 
     return PinnedGRPOTrainer
